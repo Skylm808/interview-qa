@@ -10,7 +10,6 @@
 - `fundamentals/`：Linux、操作系统、计算机网络
 - `system-design/`：系统设计、场景题、稳定性与故障隔离
 - `algorithm/`：算法题整理
-- `company/`：公司面经
 - `ai-tools/`：AI 工具链相关
 - `cross-topic/`：跨主题高频补充
 
