@@ -5,8 +5,9 @@
 ## 目录
 
 - `go/`：Go 语言基础、并发、运行时等
+- `java/`：Java 集合、并发、JVM、Spring 基础
 - `database/`：MySQL、Redis
-- `middleware/`：Kafka、gRPC、etcd、Docker、K8s、Elasticsearch
+- `middleware/`：Kafka、RabbitMQ / MQ、gRPC、etcd、Docker、K8s、Elasticsearch
 - `fundamentals/`：Linux、操作系统、计算机网络
 - `system-design/`：系统设计、场景题、稳定性与故障隔离
 - `algorithm/`：算法题整理
@@ -19,4 +20,4 @@
 
 ## 内容说明
 
-当前内容来自个人面试复习资料整理，后续可以继续补充 Java、Python、云原生、测试开发、项目面试等方向。
+当前内容来自个人面试复习资料整理，后续可以继续补充 Python、云原生、测试开发、项目面试等方向。
