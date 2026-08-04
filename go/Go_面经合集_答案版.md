@@ -1,4 +1,4 @@
-# 腾讯云智后端/后台开发面经合集 - Go模块（答案版）
+# 后端/后台开发面经合集 - Go模块（答案版）
 
 > 数据来源：牛客网、Go语言中文网等中文求职社区
 > 由 面经合集_答案版.md 按主题拆分整理
@@ -1905,5 +1905,153 @@ func (l *SafeList) Append(x int) {
 **面试里推荐这样答：**
 
 > 线程池设计的核心不是“把 goroutine 放进池子”这么简单，而是要控制并发、平衡吞吐和资源占用。一般会有任务队列和固定 worker，CPU 密集任务的 worker 数量更接近核数，IO 密集任务可以更高。如果要动态调整，我会根据队列积压、平均耗时、失败率做扩缩，但一定会设上下限，避免池子本身变成新的问题源。  
+
+---
+
+### 47. 如何组织一批 goroutine：等待、超时和统一退出？
+
+**答案：**
+
+并发程序首先要分清三类问题：
+
+- **等待完成**：用 `sync.WaitGroup`；它只负责计数，不负责取消，也不会收集错误。
+- **传递任务或结果**：用 `channel`；关闭 channel 的职责应属于发送方一侧，且只关闭一次。
+- **取消、超时和请求范围数据**：用 `context`；它是父子树，取消父 `ctx` 会通知所有子 `ctx`。
+
+下面的例子同时回答“启动 100 个 goroutine 后如何等待”“最多执行 3 秒”“总 goroutine 怎样停止内部 goroutine”。总控函数创建带超时的 context，把它传给每个 worker；worker 在可能阻塞的地方监听 `ctx.Done()` 并自行返回。`WaitGroup` 仍然负责确认所有 worker 都已收尾：
+
+```go
+func runAll(parent context.Context, jobs []Job) error {
+    ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+    defer cancel() // 上层提前返回时也通知所有 worker
+
+    var wg sync.WaitGroup
+    errCh := make(chan error, 1)
+
+    for _, job := range jobs { // jobs 可包含 100 个任务
+        job := job
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            if err := handle(ctx, job); err != nil {
+                select {
+                case errCh <- err: // 只保留第一个错误，避免阻塞 worker
+                    cancel()
+                default:
+                }
+            }
+        }()
+    }
+
+    done := make(chan struct{})
+    go func() {
+        wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        select {
+        case err := <-errCh:
+            return err
+        default:
+            return nil
+        }
+    case <-ctx.Done():
+        <-done // 只有所有 worker 都响应取消并退出后才真正返回
+        return ctx.Err()
+    }
+}
+
+func handle(ctx context.Context, job Job) error {
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case result := <-doWork(ctx, job): // doWork 自身也应使用 ctx 做 I/O
+        return result.Err
+    }
+}
+```
+
+**关键点：**`context` 不能强行杀死 goroutine，goroutine 必须协作式地检查 `ctx.Done()`；纯 CPU 长循环也要周期性检查。把 `ctx` 作为函数第一个参数传递，不传 `nil`；`WithValue` 只存 trace ID、请求 ID 等请求级元数据，不代替明确的业务参数。若只需等待，直接 `wg.Wait()` 即可；若要限并发，再额外用带缓冲的 channel 或 worker pool，不能只靠 `WaitGroup`。
+
+**面试回答：**
+
+> 等待一批 goroutine 用 WaitGroup。需要超时和上游取消时，由总控函数创建 WithTimeout 或 WithCancel 的 context，传给每个子任务，并要求每个子任务监听 Done 后返回。context 负责通知，WaitGroup 负责确认退出，两者职责不能互相替代。
+
+---
+
+### 48. `interface`、`any` 与泛型应该怎样理解？
+
+**答案：**
+
+`interface{}` 是空接口，可以接收任意类型；Go 1.18 起可用等价别名 `any`。它适合日志、通用解码和确实需要运行时分派的边界，但取回值时要用类型断言或 type switch，因此会失去编译期约束：
+
+```go
+func printValue(v any) {
+    switch x := v.(type) {
+    case string:
+        fmt.Println("string:", x)
+    case int:
+        fmt.Println("int:", x)
+    default:
+        fmt.Printf("unknown: %T\n", x)
+    }
+}
+```
+
+用 `type` 定义的 interface 不是结构体，而是一组**方法契约**；任何类型只要实现了全部方法，就自动满足该接口，无须显式声明。接口的价值是依赖抽象、便于替换实现和测试，并非“所有参数都写 interface”：优先在消费者一侧定义最小接口。
+
+```go
+type Reader interface {
+    Read(p []byte) (int, error)
+}
+
+type FileStore struct{}
+func (FileStore) Read(p []byte) (int, error) { return 0, io.EOF }
+
+var _ Reader = FileStore{} // 编译期确认实现了契约
+```
+
+泛型解决的是“同一套算法要保留类型信息”的问题。方括号中的 interface 是**类型约束**，不同于作为运行时值使用的普通接口；约束可以列出可接受类型或要求方法：
+
+```go
+type Ordered interface {
+    ~int | ~int64 | ~float64 | ~string
+}
+
+func Max[T Ordered](a, b T) T {
+    if a > b { return a }
+    return b
+}
+
+type Stringer interface { String() string }
+func Join[T Stringer](items []T) string { /* ... */ return "" }
+```
+
+选择原则：需要异构值或运行时分派时用接口/`any`；对 `int`、`string`、自定义数值等同构类型重复实现算法时用泛型；需要运行时多态、替换实现时用普通接口。不要因为有泛型就把每个小函数都泛型化。
+
+---
+
+### 49. 出现 `panic` 时怎样捕获？
+
+**答案：**
+
+`recover` 必须在同一个 goroutine 的延迟函数中调用，才能截获该 goroutine 的 panic。它不能捕获其他 goroutine 的 panic，因此启动独立 goroutine 时，如确有必要，应在 goroutine 入口放置边界保护：
+
+```go
+func safeGo(fn func()) {
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("worker panic: %v\n%s", r, debug.Stack())
+            }
+        }()
+        fn()
+    }()
+}
+```
+
+Web 服务通常在 HTTP 中间件做同样的兜底，记录堆栈并返回 500。不要用 `panic/recover` 替代普通的 `error`：参数非法、数据库超时等可预期失败应返回 `error`；只有不变量被破坏等无法安全继续的异常才使用 `panic`。捕获后也应根据业务决定是否告警、停止后续工作或返回错误，不能静默吞掉。
 
 ---
