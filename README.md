@@ -4,7 +4,7 @@
 
 ## 目录
 
-- `go/`：Go 语言基础、并发、运行时等
+- `go/`：Go 语言基础、并发、运行时、Gin、GORM 等
 - `java/`：Java 集合、并发、JVM、Spring 基础
 - `database/`：MySQL、Redis
 - `middleware/`：Kafka、RabbitMQ / MQ、gRPC、etcd、Docker、K8s、Elasticsearch
