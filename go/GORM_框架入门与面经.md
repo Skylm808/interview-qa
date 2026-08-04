@@ -155,4 +155,3 @@ err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 ## 7. 面试速答
 
 > GORM 是建立在 `database/sql` 之上的 ORM，负责把结构体和 CRUD 映射成 SQL，但不替代对 SQL、索引和事务的理解。项目里我会复用全局 DB、为每次调用传入 context、用参数化条件避免注入、为列表做分页，并把多步原子操作包进短事务。关联查询会警惕 N+1，必要时用 Preload、Join 或手写 SQL，并通过日志和 EXPLAIN 验证性能。
-

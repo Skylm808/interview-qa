@@ -141,4 +141,3 @@ Gin 建立在 `net/http` 之上，最终仍是一个 `http.Handler`。Gin 减少
 ## 6. 面试速答
 
 > Gin 是基于 `net/http` 的高性能 Web 框架。请求先匹配路由，再按顺序通过中间件，最后进入 Handler。Handler 负责绑定和校验输入、调用业务层、返回响应；鉴权、日志、Recover、链路追踪等横切逻辑放中间件。数据库和 RPC 调用使用 `c.Request.Context()`，使请求取消和超时能够向下游传播。
-
