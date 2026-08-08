@@ -2055,3 +2055,113 @@ func safeGo(fn func()) {
 Web 服务通常在 HTTP 中间件做同样的兜底，记录堆栈并返回 500。不要用 `panic/recover` 替代普通的 `error`：参数非法、数据库超时等可预期失败应返回 `error`；只有不变量被破坏等无法安全继续的异常才使用 `panic`。捕获后也应根据业务决定是否告警、停止后续工作或返回错误，不能静默吞掉。
 
 ---
+
+### 50. 如何手写一个线程安全的 LRU Cache？
+
+**答案：**
+
+`LRU`（Least Recently Used）要求最近访问的数据放在队头、淘汰队尾。沿用力扣里熟悉的写法，组合使用：
+
+- `map[int]*DlistNode`：按 key 直接定位节点；
+- 手写双向链表：`head`、`tail` 是哨兵节点，队头是最新、队尾是最旧；
+- `sync.Mutex`：保护 map 和链表这两个必须同步更新的共享结构。
+
+注意 `Get` 虽然逻辑上是读，却会把节点移动到队头，所以不能只拿 `RLock`。下面是在原有实现上补充互斥锁和容量保护后的版本：
+
+```go
+package lru
+
+import "sync"
+
+type DlistNode struct {
+	key, val   int
+	prev, next *DlistNode
+}
+
+type LRUCache struct {
+	mu         sync.Mutex
+	capacity   int
+	cache      map[int]*DlistNode
+	head, tail *DlistNode
+}
+
+func Constructor(capacity int) LRUCache {
+	head := &DlistNode{}
+	tail := &DlistNode{}
+	head.next = tail
+	tail.prev = head
+	return LRUCache{
+		capacity: capacity,
+		cache:    make(map[int]*DlistNode),
+		head:     head,
+		tail:     tail,
+	}
+}
+
+func (c *LRUCache) Get(key int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, exists := c.cache[key]
+	if !exists {
+		return -1
+	}
+	c.moveFront(node)
+	return node.val
+}
+
+func (c *LRUCache) Put(key, value int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.capacity <= 0 {
+		return
+	}
+	if node, exists := c.cache[key]; exists {
+		node.val = value
+		c.moveFront(node)
+		return
+	}
+	if len(c.cache) >= c.capacity {
+		c.removeLast()
+	}
+	node := &DlistNode{key: key, val: value}
+	c.cache[key] = node
+	c.addToFront(node)
+}
+
+func (c *LRUCache) moveFront(node *DlistNode) {
+	c.remove(node)
+	c.addToFront(node)
+}
+
+func (c *LRUCache) remove(node *DlistNode) {
+	node.prev.next = node.next
+	node.next.prev = node.prev
+}
+
+func (c *LRUCache) addToFront(node *DlistNode) {
+	first := c.head.next
+	node.prev = c.head
+	node.next = first
+	c.head.next = node
+	first.prev = node
+}
+
+func (c *LRUCache) removeLast() {
+	last := c.tail.prev
+	if last == c.head {
+		return
+	}
+	c.remove(last)
+	delete(c.cache, last.key)
+}
+```
+
+`Mutex` 的好处是语义清晰：map、链表移动、淘汰始终是一个原子临界区。`remove`、`addToFront` 等辅助方法只在已经持锁的 `Get` / `Put` 内调用，不单独加锁，避免重复加锁。若容量很大且并发极高，可进一步考虑分片 LRU 或专门缓存库；单纯换成 `RWMutex` 并不能让 `Get` 并发，因为 `Get` 仍会修改链表。
+
+**面试回答：**
+
+> LRU 用哈希表加双向链表实现，哈希表 `O(1)` 找节点，链表 `O(1)` 把节点提到队头或淘汰队尾。线程安全时，map 和链表必须在同一把锁保护下；特别是 `Get` 会更新访问顺序，所以也是写操作，不能只用读锁。插入超过容量时删掉队尾节点，并同步从 map 删除。
+
+---
