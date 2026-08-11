@@ -426,6 +426,50 @@ go get github.com/gin-gonic/gin@v1.8.0
 go mod edit -replace github.com/old=../local/path
 ```
 
+**面试常问：Go 项目从修改到提交，常用哪些命令？**
+
+可以按“格式化 -> 测试 -> 静态检查 -> 构建”的顺序记：
+
+| 命令 | 全称 / 作用 | 常用示例 |
+| --- | --- | --- |
+| `go fmt` | Go format，格式化源码 | `go fmt ./...` |
+| `go test` | 编译并运行测试 | `go test ./...` |
+| `go test -v` | verbose，显示每个测试详情 | `go test -v ./pkg/...` |
+| `go test -run` | 只运行匹配名称的测试 | `go test -run TestLogin ./...` |
+| `go test -race` | race detector，检测数据竞争 | `go test -race ./...` |
+| `go vet` | 静态分析，检查可疑代码 | `go vet ./...` |
+| `go build` | 编译当前包或程序，不运行 | `go build ./...` |
+| `go run` | 编译并运行临时程序 | `go run ./cmd/server` |
+| `go install` | 编译并安装命令到 `GOBIN` | `go install ./cmd/tool` |
+| `go list` | 列出包或模块信息 | `go list ./...`、`go list -m all` |
+| `go doc` | 查看包、类型和函数文档 | `go doc net/http.ListenAndServe` |
+| `go env` | 查看或设置 Go 环境变量 | `go env GOPATH GOMOD GOPROXY` |
+| `go clean` | 清理构建缓存等临时产物 | `go clean -cache` |
+
+**`go mod` 常用子命令：**
+
+| 命令 | 含义 |
+| --- | --- |
+| `go mod init <module>` | 初始化模块并生成 `go.mod` |
+| `go mod tidy` | 补齐实际使用的依赖，删除未使用依赖，并更新 `go.sum` |
+| `go mod download` | 下载模块到本地缓存，不负责修改源码 |
+| `go mod graph` | 查看模块依赖图 |
+| `go mod why -m <module>` | 解释当前项目为什么依赖某模块 |
+| `go mod verify` | 校验本地模块缓存内容是否被篡改 |
+| `go mod edit` | 以命令方式修改 `go.mod`，如添加 `replace` |
+
+**几个容易混淆的点：**
+
+- `go get` 主要用于调整依赖版本；新版本 Go 中，安装命令行工具应使用 `go install tool@version`，不要把工具依赖混进业务 `go.mod`。
+- `go test` 即使没有测试文件，也会先编译包；因此它常被用作比 `go build` 更贴近项目验证的命令。
+- `go vet` 不是完整 lint，也不能证明没有 bug；它检查的是一组常见的可疑用法，通常和 `go test`、第三方 lint 工具配合。
+- `go test -race` 只能发现实际执行路径上的数据竞争，会明显增加运行时间和内存开销，适合测试环境，不宜直接作为生产启动参数。
+- `go test ./...` 中的 `./...` 表示当前模块下的所有包；`go test ./pkg/...` 则只覆盖 `pkg` 子树。
+
+**面试速答：**
+
+> 我通常先用 `go fmt ./...` 统一格式，再用 `go test ./...` 验证功能；并发代码会补 `go test -race ./...`，然后用 `go vet ./...` 做静态检查，最后用 `go build ./...` 确认能编译。依赖方面，`go mod tidy` 负责整理依赖，`go mod download` 只负责下载，`go mod verify` 用来校验缓存，`go list -m all` 可以查看最终依赖版本。
+
 ---
 
 ### 12. slice的底层结构是什么？扩容机制是怎样的？
