@@ -2209,3 +2209,73 @@ func (c *LRUCache) removeLast() {
 > LRU 用哈希表加双向链表实现，哈希表 `O(1)` 找节点，链表 `O(1)` 把节点提到队头或淘汰队尾。线程安全时，map 和链表必须在同一把锁保护下；特别是 `Get` 会更新访问顺序，所以也是写操作，不能只用读锁。插入超过容量时删掉队尾节点，并同步从 map 删除。
 
 ---
+
+### 51. 线上如何通过日志排查一条请求？`context` 和 `trace_id` 怎么配合？
+
+**答案：**
+
+核心做法是：**请求进入系统边界时确定 trace ID，放进 `context`，后续日志统一从 `ctx` 取出并打印；调用下游时再把它透传出去。** 不要在每个函数里重新生成 trace ID，否则一条请求会被拆成多条无法关联的链路。
+
+#### 什么时候生成或透传？
+
+通常只在这些“链路入口”处理一次：
+
+1. HTTP 服务的最外层 middleware：优先读取上游的 `traceparent` 或 `X-Trace-ID`；没有或格式非法时才生成新的 ID。
+2. gRPC 服务端 unary/stream interceptor：从 metadata 读取并写入 `ctx`。
+3. MQ 消费者、定时任务、脚本任务：从消息 header/任务参数恢复；没有上游链路时生成一个新的 ID。
+
+进入业务函数后只传递 `ctx`，不重复生成。`request_id` 可以作为一次 HTTP 请求的短 ID，`trace_id` 则贯穿多个服务；使用 OpenTelemetry 时还会为每个服务调用生成不同的 `span_id`。
+
+#### 最小实现
+
+```go
+type traceIDKey struct{}
+
+func withTraceID(ctx context.Context, traceID string) context.Context {
+	return context.WithValue(ctx, traceIDKey{}, traceID)
+}
+
+func traceIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(traceIDKey{}).(string)
+	return id
+}
+
+func HTTPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-ID")
+		if !validTraceID(traceID) {
+			traceID = newTraceID()
+		}
+		ctx := withTraceID(r.Context(), traceID)
+		w.Header().Set("X-Trace-ID", traceID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func logInfo(ctx context.Context, msg string, fields ...any) {
+	// 实际项目可替换成 slog、zap 或 zerolog。
+	args := append([]any{"trace_id", traceIDFrom(ctx)}, fields...)
+	logger.InfoContext(ctx, msg, args...)
+}
+```
+
+下游 HTTP/gRPC 调用要把 `trace_id` 放入请求 header 或 metadata；Kafka 等 MQ 则放入消息 headers。异步 goroutine 要显式传入当前 `ctx`，若不希望请求取消影响后台任务，可以复制 trace ID 到新的任务 context，但不能把原请求 context 无限制地长期保存。
+
+#### 一条线上排查流程
+
+```text
+用户报错/告警
+  -> 入口日志拿 trace_id
+  -> 按 trace_id 查网关、应用、RPC、SQL、MQ 日志
+  -> 根据耗时字段定位慢服务或慢 SQL
+  -> 根据 error、request_id、span_id 还原具体失败节点
+  -> 结合 metrics、trace、pprof 判断是流量、依赖、锁等待还是资源瓶颈
+```
+
+日志至少应包含时间、服务名、环境、`trace_id`、`span_id`（如有）、请求路径、状态码、耗时和错误堆栈。不要把密码、Token、身份证号等敏感信息直接写入日志，也不要只打印 `err.Error()` 而丢失调用栈。
+
+**面试回答：**
+
+> 我会在 HTTP middleware、gRPC interceptor、MQ 消费入口和任务入口生成或透传 trace ID，然后放进 context。业务函数不重新生成，只把 ctx 往下传；结构化日志统一从 ctx 注入 trace_id，下游 RPC 和 MQ 通过 header/metadata 继续透传。线上拿到 trace_id 后，可以串起网关、服务、数据库和消息队列日志，再结合耗时、指标和 pprof 定位问题。
+
+---
