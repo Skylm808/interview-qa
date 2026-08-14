@@ -2279,3 +2279,25 @@ func logInfo(ctx context.Context, msg string, fields ...any) {
 > 我会在 HTTP middleware、gRPC interceptor、MQ 消费入口和任务入口生成或透传 trace ID，然后放进 context。业务函数不重新生成，只把 ctx 往下传；结构化日志统一从 ctx 注入 trace_id，下游 RPC 和 MQ 通过 header/metadata 继续透传。线上拿到 trace_id 后，可以串起网关、服务、数据库和消息队列日志，再结合耗时、指标和 pprof 定位问题。
 
 ---
+
+### 52. Go 的 GC 有什么痛点？后端服务如何优化延迟？
+
+**答案：**
+
+Go 是并发标记清扫 GC。它的痛点通常不是简单的“Stop The World 很长”，而是高分配率、大堆、存活对象过多、指针密集对象和大量 Goroutine 栈扫描带来的 GC CPU 消耗与 p99 抖动。GC 跟不上分配时，业务 goroutine 会参与 GC assist，请求延迟会变差。
+
+排查时先看 `runtime/metrics`、`GODEBUG=gctrace=1`、GC 次数、heap 大小和 pause；再用 heap profile 区分：
+
+- `alloc_space`：谁累计分配最多，适合找高频临时对象；
+- `inuse_space`：谁现在仍持有内存，适合找缓存、泄漏和大对象；
+- CPU profile：确认 GC 是否真的占用了大量 CPU，而不是慢在锁、网络或数据库。
+
+优化优先级是先减少分配，再调参数：批量处理、复用 buffer、避免高频 `fmt.Sprintf` 和不必要的 JSON 编解码、缩短对象生命周期。热点明确后才使用 `sync.Pool`，不要把它当成通用缓存。容器环境设置 `GOMEMLIMIT` 控制总内存；`GOGC` 调低会更频繁回收、内存更稳但 CPU 更高，调高则可能提高吞吐但放大内存与尾延迟，必须压测后决定。
+
+**例子：**订单查询接口每次都把数据库行转换成多个临时 `map[string]any`，再多次 JSON 编码。流量高时 `alloc_space` 显示该链路分配量最高，GC CPU 占比升高，p99 从 80ms 升到 300ms。改为固定 DTO、一次编码、复用响应 buffer 后，分配率下降；再结合合理的 `GOMEMLIMIT`，GC 更稳定。这里不是先改 `GOGC`，而是先消除高频分配源头。
+
+**面试回答：**
+
+> 我会先证明确实是 GC：看 gctrace、runtime 指标、heap 和 CPU profile。常见根因是高分配率、大对象/长生命周期对象、指针多和 Goroutine 过多。优化先减少分配和缩短生命周期，确认热点后谨慎用 sync.Pool；最后结合容器内存预算调 GOMEMLIMIT 和 GOGC。目标不是让 GC 次数最少，而是在内存、CPU 和 p99 延迟之间取得可量化的平衡。
+
+---
