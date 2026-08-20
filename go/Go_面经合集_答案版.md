@@ -1030,6 +1030,142 @@ func worker(ctx context.Context) error {
 
 ---
 
+### 19A. 父 `ctx`、子 `ctx` 的 `Done()` 是怎样传播的？下游会不会继续执行？
+
+**答案：**
+
+先记结论：
+
+- 父 context 被取消、超时或到达 deadline 后，所有从它派生出来的子 context 都会被取消；子 context 的 `Done()` 会关闭，`Err()` 返回父取消的原因或自己的超时原因。
+- 子 context 自己调用 `cancel()`，**不会**取消父 context，也不会取消它的兄弟 context。
+- context 只负责发出“该停了”的信号，**不会强制杀掉 goroutine**。下游是否真正退出，取决于它有没有监听 `ctx.Done()`，以及它调用的 I/O、DB、RPC API 是否接收这个 ctx。
+
+#### 一、父子树关系
+
+```text
+requestCtx (HTTP 请求)
+├── dbCtx       = WithTimeout(requestCtx, 200ms)
+├── profileCtx  = WithCancel(requestCtx)
+│   └── cacheCtx = WithTimeout(profileCtx, 50ms)
+└── auditCtx    = WithTimeout(requestCtx, 1s)
+```
+
+如果客户端断开、HTTP Server 取消 `requestCtx`，或请求总超时：
+
+```text
+requestCtx.Done() 关闭
+  -> dbCtx.Done() 关闭
+  -> profileCtx.Done() 关闭
+      -> cacheCtx.Done() 关闭
+  -> auditCtx.Done() 关闭
+```
+
+反过来，`cancel(profileCtx)` 只会影响 `profileCtx` 和 `cacheCtx`，`dbCtx`、`auditCtx` 以及 `requestCtx` 仍可继续使用，直到各自完成、超时或父 context 被取消。
+
+#### 二、一个完整请求链路例子
+
+下面模拟“查询用户详情”：HTTP Handler 同时查用户信息和推荐信息。请求最多 800ms；用户信息查询有自己的 200ms 子超时；推荐服务有 300ms 子超时。任何一个子任务提前结束，都应调用自己的 `cancel()` 释放 timer 和与父节点的关联。
+
+```go
+func userHandler(w http.ResponseWriter, r *http.Request) {
+    // r.Context() 会在客户端断开或 Server 结束请求时被取消。
+    ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
+    defer cancel()
+
+    userCtx, cancelUser := context.WithTimeout(ctx, 200*time.Millisecond)
+    defer cancelUser()
+
+    recCtx, cancelRec := context.WithTimeout(ctx, 300*time.Millisecond)
+    defer cancelRec()
+
+    var (
+        user User
+        recs []Recommendation
+        wg   sync.WaitGroup
+        errCh = make(chan error, 2)
+    )
+
+    wg.Add(2)
+    go func() {
+        defer wg.Done()
+        var err error
+        // db.QueryContext 会监听 userCtx；超时或父请求取消时会尝试停止查询。
+        user, err = queryUser(userCtx, "1001")
+        errCh <- err
+    }()
+    go func() {
+        defer wg.Done()
+        var err error
+        // gRPC 调用也应传 recCtx，使 deadline/cancel 传到下游。
+        recs, err = recommendationClient.List(recCtx, "1001")
+        errCh <- err
+    }()
+
+    done := make(chan struct{})
+    go func() { wg.Wait(); close(done) }()
+
+    select {
+    case <-ctx.Done():
+        // 这里只是返回；两个下游能否尽快停止，取决于它们是否正确使用 userCtx/recCtx。
+        http.Error(w, ctx.Err().Error(), http.StatusGatewayTimeout)
+        return
+    case <-done:
+        // 读取 errCh、组装响应，示例省略。
+        _ = user
+        _ = recs
+    }
+}
+```
+
+**发生三种情况时的行为：**
+
+| 事件 | 哪些 `Done()` 关闭 | 下游会怎样 |
+| --- | --- | --- |
+| 客户端 100ms 时断开 | `ctx`、`userCtx`、`recCtx` 都关闭 | `QueryContext` / gRPC 若接收 ctx，会收到取消并尽快返回；没监听的 goroutine 仍可能继续跑 |
+| `userCtx` 到 200ms 超时 | 只有 `userCtx` 关闭 | 查用户超时；推荐 `recCtx` 和父 `ctx` 仍可继续，Handler 可按业务决定降级还是整体失败 |
+| `cancelRec()` 主动调用 | `recCtx` 关闭 | 只停止推荐调用；不影响用户查询和父请求 |
+
+#### 三、为什么“ctx 已经 Done 了，下游还在跑”？
+
+最常见原因是 goroutine 没有协作退出：
+
+```go
+// 错误：只把 ctx 传进来，但阻塞操作完全不检查它。
+func badWorker(ctx context.Context, jobs <-chan Job) {
+    for job := range jobs {
+        handle(job) // 可能一直阻塞
+    }
+}
+
+// 正确：在等待任务和耗时操作的边界监听 ctx.Done()。
+func worker(ctx context.Context, jobs <-chan Job) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case job, ok := <-jobs:
+            if !ok {
+                return
+            }
+            if err := handleWithContext(ctx, job); err != nil {
+                return
+            }
+        }
+    }
+}
+```
+
+- `time.Sleep` 不会因为 ctx 取消自动中断；需要改成 `select { case <-time.After(d): case <-ctx.Done(): }`，或使用可取消的 timer。
+- `http.NewRequestWithContext`、`db.QueryContext`、gRPC 调用等 API 才能把取消传播到网络、数据库或下游服务。
+- CPU 密集循环也需要定期检查 `ctx.Err()`，否则即使 `Done()` 已关闭，循环仍会继续占 CPU。
+- 启动 goroutine 后，调用方若要等待收尾，仍需 `WaitGroup`、`errgroup` 或结果 channel；context 不会替代等待机制。
+
+**面试里推荐这样答：**
+
+> context 是一棵单向取消树。父 ctx 取消会级联取消所有子孙 ctx；子 ctx 自己取消只影响自己和子孙，不会反向影响父或兄弟。`Done()` 关闭只是通知，不会强杀 goroutine，所以每个阻塞点都要显式监听 `ctx.Done()`，并把 ctx 传给 HTTP、DB、gRPC 等支持取消的 API。实际链路里我会在入口创建总 deadline，再给 DB、RPC 等下游分配更短的子 deadline；每个 `WithCancel/WithTimeout` 都 `defer cancel()`，WaitGroup 负责等待 goroutine 真正退出。
+
+---
+
 ### 47. 如何组织一批 goroutine：等待、超时和统一退出？
 
 **答案：**
@@ -2214,6 +2350,142 @@ fmt.Println(reflect.DeepEqual(d1, d2)) // true
 - 它们本质上都包含两部分：类型信息 + 数据指针。
 - 空接口只需要知道“具体类型是什么”；非空接口还需要方法表来支持动态派发。
 - 所以接口赋值、断言、类型转换，底层都离不开类型信息和数据指针。
+
+---
+
+### 34A. Go 接口怎么用？方法集、指针接收者、断言和常见坑分别是什么？
+
+**答案：**
+
+接口不是“父类”，而是一组方法契约。Go 使用隐式实现：一个类型只要拥有接口要求的全部方法，就自动满足接口，不需要写 `implements`。
+
+```go
+type Notifier interface {
+    Notify(ctx context.Context, message string) error
+}
+
+type EmailNotifier struct{}
+
+func (EmailNotifier) Notify(ctx context.Context, message string) error {
+    fmt.Println("send email:", message)
+    return nil
+}
+
+func sendWelcome(ctx context.Context, n Notifier) error {
+    return n.Notify(ctx, "welcome")
+}
+
+var _ Notifier = EmailNotifier{} // 编译期检查：改方法签名会直接报错
+```
+
+调用方依赖 `Notifier`，测试时可以传 fake/mock，实现从邮件替换为短信、站内信时不必修改业务函数。这就是接口最常见的价值：隔离变化、方便替换和测试。
+
+#### 一、接口应由消费者定义，并保持最小
+
+不要为一个大对象预先定义几十个方法的“万能接口”。使用方需要什么，就在使用方附近定义什么：
+
+```go
+// 订单服务只需要读取，不需要知道存储层还有 Delete、Update 等方法。
+type UserFinder interface {
+    FindByID(ctx context.Context, id int64) (User, error)
+}
+
+type OrderService struct {
+    users UserFinder
+}
+```
+
+- 小接口更容易实现、更容易 mock，也降低耦合。
+- 函数参数不需要为了“未来扩展”一律写成 interface；如果只会传一个明确的 `*sql.DB` 或具体结构体，直接使用具体类型更清楚。
+- Go 标准库的 `io.Reader` 只有一个 `Read` 方法，就是“小接口在消费者侧定义”的典型例子。
+
+#### 二、方法集：值接收者和指针接收者
+
+这是接口最常见的编译错误来源。
+
+```go
+type Counter struct{ n int }
+
+func (c *Counter) Inc() { c.n++ } // 指针接收者
+func (c Counter) Value() int { return c.n } // 值接收者
+
+type Incrementer interface {
+    Inc()
+}
+
+var _ Incrementer = (*Counter)(nil) // 正确
+// var _ Incrementer = Counter{}    // 错误：Counter 的方法集不包含 Inc
+```
+
+规则如下：
+
+| 接收者方法 | `T` 的方法集 | `*T` 的方法集 |
+| --- | --- | --- |
+| 值接收者 `func (T) M()` | 包含 `M` | 包含 `M` |
+| 指针接收者 `func (*T) M()` | 不包含 `M` | 包含 `M` |
+
+- 如果方法需要修改对象、对象很大不想复制、或类型内含 `sync.Mutex` 等不可复制字段，通常用指针接收者。
+- 一旦某个核心方法使用指针接收者，实践中同一类型的方法通常也统一使用指针接收者，避免使用方分不清该传 `T` 还是 `*T`。
+- `var n Notifier = &EmailNotifier{}` 和 `var n Notifier = EmailNotifier{}` 是否都合法，要看 `Notify` 是值接收者还是指针接收者。
+
+#### 三、接口赋值、断言和 type switch
+
+接口变量在运行时包含“动态类型 + 动态值”。需要取回具体实现时可使用类型断言：
+
+```go
+func retryable(err error) bool {
+    type temporary interface{ Temporary() bool }
+
+    t, ok := err.(temporary)
+    return ok && t.Temporary()
+}
+```
+
+- 单值断言 `v := x.(T)` 失败会 panic，只有已经确定类型时才适合使用。
+- 双值断言 `v, ok := x.(T)` 更安全，适合处理可选能力。
+- 当要区分多种动态类型时，用 type switch：
+
+```go
+func describe(v any) string {
+    switch x := v.(type) {
+    case string:
+        return "text: " + x
+    case int:
+        return fmt.Sprintf("number: %d", x)
+    case fmt.Stringer:
+        return x.String()
+    default:
+        return fmt.Sprintf("unknown: %T", v)
+    }
+}
+```
+
+#### 四、`nil` 接口陷阱
+
+```go
+type MyError struct{ message string }
+func (e *MyError) Error() string { return e.message }
+
+func load() error {
+    var e *MyError = nil
+    return e // 返回的 error 动态类型是 *MyError，动态值才是 nil
+}
+
+err := load()
+fmt.Println(err == nil) // false
+```
+
+接口只有“动态类型和动态值都为 nil”时，接口本身才等于 `nil`。因此返回 `error` 时，若没有错误应直接 `return nil`，不要返回一个类型为 `*MyError` 的 nil 指针。已有第 35 题讲底层原因，这里重点是实际写代码时避免这个坑。
+
+#### 五、接口、`any` 和泛型如何选择？
+
+- **普通接口**：需要运行时多态和可替换实现，例如存储、支付、通知、日志输出；方法本身是契约。
+- **`any` / `interface{}`**：确实需要接收异构数据，例如通用 JSON 解码、日志字段；随后要通过断言或 type switch 恢复类型。
+- **泛型**：同一算法处理多个同构类型，并希望保留编译期类型检查，例如 `Max[T Ordered]`、通用容器；它不替代“不同实现按同一方法工作”的接口。
+
+**面试里推荐这样答：**
+
+> Go 接口是一组方法契约，类型隐式实现接口。工程上我会让消费者定义最小接口，让业务依赖抽象而不是具体存储或通知实现；用 `var _ Interface = (*Type)(nil)` 做编译期检查。要特别注意方法集：值接收者的方法属于 `T` 和 `*T`，指针接收者的方法只属于 `*T`。运行时需要识别具体类型时用安全的双值断言或 type switch；返回 error 时注意带类型的 nil 指针放进接口后不等于 nil。接口用于运行时多态，泛型用于同构算法，不应该混用。
 
 ---
 
