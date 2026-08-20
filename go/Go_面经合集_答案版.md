@@ -206,7 +206,7 @@ for i := 0; i < 10001; i++ {
 
 ## 并发通信与控制
 
-### 16. channel的内部结构是什么？收发流程是怎样的？
+### 7. channel的内部结构是什么？收发流程是怎样的？
 
 **答案：**
 
@@ -292,7 +292,7 @@ fmt.Println(<-ch)
 
 ---
 
-### 17. channel关闭后继续读写会发生什么？
+### 8. channel关闭后继续读写会发生什么？
 
 **答案：**
 
@@ -324,7 +324,7 @@ v2, ok2 := <-ch // v2=0, ok2=false
 
 ---
 
-### 18. select的用途是什么？
+### 9. select的用途是什么？
 
 **答案：**
 
@@ -394,7 +394,7 @@ Go runtime 会在所有已经就绪的 case 中，**伪随机挑一个执行**�
 
 ---
 
-### 20. sync.Mutex的实现原理？正常模式和饥饿模式有什么区别？
+### 10. sync.Mutex的实现原理？正常模式和饥饿模式有什么区别？
 
 **答案：**
 
@@ -439,7 +439,7 @@ type Mutex struct {
 
 ---
 
-### 21. sync.RWMutex读写锁的特点是什么？
+### 11. sync.RWMutex读写锁的特点是什么？
 
 **答案：**
 
@@ -486,7 +486,7 @@ type SafeData struct {
 
 ---
 
-### 22. sync.WaitGroup怎么使用？
+### 12. sync.WaitGroup怎么使用？
 
 **答案：**
 
@@ -537,7 +537,7 @@ for i := 0; i < 10; i++ {
 
 ---
 
-### 23. Channel和Mutex应该如何选择？各自适用什么场景？
+### 13. Channel和Mutex应该如何选择？各自适用什么场景？
 
 **答案：**
 
@@ -583,7 +583,7 @@ func consumer(ch <-chan int) {
 
 ---
 
-### 31. singleflight底层实现是什么？
+### 14. singleflight底层实现是什么？
 
 **答案：**
 
@@ -655,7 +655,7 @@ func getData(key string) (interface{}, error) {
 
 ---
 
-### 32. sync.Once的原理是什么？
+### 15. sync.Once的原理是什么？
 
 **答案：**
 
@@ -666,7 +666,7 @@ func getData(key string) (interface{}, error) {
 
 ---
 
-### 33. atomic包和Mutex应该怎么选？
+### 16. atomic包和Mutex应该怎么选？
 
 **答案：**
 
@@ -677,7 +677,7 @@ func getData(key string) (interface{}, error) {
 
 ---
 
-### 36. nil channel 和已经关闭的 channel 有什么区别？
+### 17. nil channel 和已经关闭的 channel 有什么区别？
 
 **答案：**
 
@@ -688,7 +688,7 @@ func getData(key string) (interface{}, error) {
 
 ---
 
-### 41. sync.Cond 是什么？它和 channel 有什么区别？
+### 18. sync.Cond 是什么？它和 channel 有什么区别？
 
 **答案：**
 
@@ -699,7 +699,7 @@ func getData(key string) (interface{}, error) {
 
 ---
 
-### 45. 如何实现线程安全的 list？
+### 19. 如何实现线程安全的 list？
 
 **答案：**
 
@@ -731,7 +731,7 @@ func (l *SafeList) Append(x int) {
 
 ---
 
-### 46. 线程池怎么设计？核心参数怎么定？如果要动态调整怎么做？
+### 20. 线程池怎么设计？核心参数怎么定？如果要动态调整怎么做？
 
 **答案：**
 
@@ -773,7 +773,7 @@ func (l *SafeList) Append(x int) {
 
 ---
 
-### 50. 如何手写一个线程安全的 LRU Cache？
+### 21. 如何手写一个线程安全的 LRU Cache？
 
 **答案：**
 
@@ -885,7 +885,7 @@ func (c *LRUCache) removeLast() {
 
 ## Context、请求链路与可观测性
 
-### 19. context包的作用是什么？
+### 22. context包的作用是什么？
 
 **答案：**
 
@@ -1030,7 +1030,7 @@ func worker(ctx context.Context) error {
 
 ---
 
-### 19A. 父 `ctx`、子 `ctx` 的 `Done()` 是怎样传播的？下游会不会继续执行？
+### 23. 父 `ctx`、子 `ctx` 的 `Done()` 是怎样传播的？下游会不会继续执行？
 
 **答案：**
 
@@ -1166,7 +1166,7 @@ func worker(ctx context.Context, jobs <-chan Job) {
 
 ---
 
-### 47. 如何组织一批 goroutine：等待、超时和统一退出？
+### 24. 如何组织一批 goroutine：等待、超时和统一退出？
 
 **答案：**
 
@@ -1239,7 +1239,7 @@ func handle(ctx context.Context, job Job) error {
 
 ---
 
-### 51. 线上如何通过日志排查一条请求？`context` 和 `trace_id` 怎么配合？
+### 25. 线上如何通过日志排查一条请求？`context` 和 `trace_id` 怎么配合？
 
 **答案：**
 
@@ -1311,7 +1311,7 @@ func logInfo(ctx context.Context, msg string, fields ...any) {
 
 ## Map、Slice 与内存分配
 
-### 12. slice的底层结构是什么？扩容机制是怎样的？
+### 26. slice的底层结构是什么？扩容机制是怎样的？
 
 **答案：**
 
@@ -1363,7 +1363,7 @@ s2 = append(s2, 4) // 修改了s1[2]！
 
 ---
 
-### 13. slice和数组的区别是什么？
+### 27. slice和数组的区别是什么？
 
 **答案：**
 
@@ -1388,7 +1388,7 @@ slice2 := slice // 共享底层数组
 
 ---
 
-### 14. map的底层结构是什么？是否线程安全？
+### 28. map的底层结构是什么？是否线程安全？
 
 **答案：**
 
@@ -1436,7 +1436,7 @@ go func() { _ = m["a"] }()
 
 ---
 
-### 15. 如何实现线程安全的 map？`sync.Map` 又是什么？
+### 29. 如何实现线程安全的 map？`sync.Map` 又是什么？
 
 **答案：**
 
@@ -1479,7 +1479,7 @@ func (sm *SafeMap) Set(key string, val int) {
 
 ---
 
-### 15A. `sync.Map` 是什么？适合什么场景？底层大致怎么实现？
+### 30. `sync.Map` 是什么？适合什么场景？底层大致怎么实现？
 
 **答案：**
 
@@ -1597,7 +1597,7 @@ m.Range(func(key, value any) bool {
 
 ---
 
-### 24. 什么是内存逃逸？有哪些常见的内存逃逸场景？
+### 31. 什么是内存逃逸？有哪些常见的内存逃逸场景？
 
 **答案：**
 
@@ -1655,7 +1655,7 @@ for i := 0; i < 10000; i++ {
 
 ---
 
-### 29. make和new的区别是什么？
+### 32. make和new的区别是什么？
 
 **答案：**
 
@@ -1698,7 +1698,7 @@ m["a"] = 1 // OK
 
 ---
 
-### 37. sync.Pool 适合什么场景？有什么注意事项？
+### 33. sync.Pool 适合什么场景？有什么注意事项？
 
 **答案：**
 
@@ -1711,7 +1711,7 @@ m["a"] = 1 // OK
 
 ## GC 与内存问题
 
-### 7. Go的GC机制是什么？讲一下三色标记算法原理
+### 34. Go的GC机制是什么？讲一下三色标记算法原理
 
 **答案：**
 
@@ -1745,7 +1745,7 @@ m["a"] = 1 // OK
 
 ---
 
-### 8. Go的GC触发时机有哪些？
+### 35. Go的GC触发时机有哪些？
 
 **答案：**
 
@@ -1787,7 +1787,7 @@ m["a"] = 1 // OK
 
 ---
 
-### 9. 写屏障是什么？插入屏障和删除屏障有什么区别？
+### 36. 写屏障是什么？插入屏障和删除屏障有什么区别？
 
 **答案：**
 
@@ -1860,7 +1860,7 @@ func writePointer(slot *unsafe.Pointer, ptr unsafe.Pointer) {
 
 ---
 
-### 10. Java的GC和Go的GC哪个好？各自的优缺点？
+### 37. Java的GC和Go的GC哪个好？各自的优缺点？
 
 **答案：**
 
@@ -1887,7 +1887,7 @@ func writePointer(slot *unsafe.Pointer, ptr unsafe.Pointer) {
 
 ---
 
-### 43. Go GC 里的“活动对象”是什么？
+### 38. Go GC 里的“活动对象”是什么？
 
 **答案：**
 
@@ -1900,7 +1900,7 @@ func writePointer(slot *unsafe.Pointer, ptr unsafe.Pointer) {
 
 ---
 
-### 52. Go 的 GC 有什么痛点？后端服务如何优化延迟？
+### 39. Go 的 GC 有什么痛点？后端服务如何优化延迟？
 
 **答案：**
 
@@ -1980,7 +1980,7 @@ DTO 的字段是固定的，`items` 是一段连续的结构体列表，不必�
 
 ## 并发故障排查
 
-### 25. 如何检测并发资源竞争问题？
+### 40. 如何检测并发资源竞争问题？
 
 **答案：**
 
@@ -2031,7 +2031,7 @@ Previous write at 0x... by goroutine 6:
 
 ---
 
-### 27. pprof工具怎么使用？如何排查内存泄漏？
+### 41. pprof工具怎么使用？如何排查内存泄漏？
 
 **答案：**
 
@@ -2083,7 +2083,7 @@ go tool pprof http://localhost:6060/debug/pprof/block
 
 ---
 
-### 40. 常见的 goroutine 泄漏场景有哪些？如何排查？
+### 42. 常见的 goroutine 泄漏场景有哪些？如何排查？
 
 **答案：**
 
@@ -2098,7 +2098,7 @@ go tool pprof http://localhost:6060/debug/pprof/block
 
 ## 语言机制与工程工具
 
-### 11. Go怎么获取第三方的包并管理？go module了解吗？
+### 43. Go怎么获取第三方的包并管理？go module了解吗？
 
 **答案：**
 
@@ -2190,7 +2190,7 @@ go mod edit -replace github.com/old=../local/path
 
 ---
 
-### 26. Go的反射机制是什么？运行时是如何实现的？
+### 44. Go的反射机制是什么？运行时是如何实现的？
 
 **答案：**
 
@@ -2248,7 +2248,7 @@ type eface struct { // 空接口
 
 ---
 
-### 28. defer的执行顺序是什么？
+### 45. defer的执行顺序是什么？
 
 **答案：**
 
@@ -2300,7 +2300,7 @@ func safe() {
 
 ---
 
-### 30. struct能否比较？
+### 46. struct能否比较？
 
 **答案：**
 
@@ -2342,7 +2342,7 @@ fmt.Println(reflect.DeepEqual(d1, d2)) // true
 
 ---
 
-### 34. interface的底层结构是什么？
+### 47. interface的底层结构是什么？
 
 **答案：**
 
@@ -2353,7 +2353,7 @@ fmt.Println(reflect.DeepEqual(d1, d2)) // true
 
 ---
 
-### 34A. Go 接口怎么用？方法集、指针接收者、断言和常见坑分别是什么？
+### 48. Go 接口怎么用？方法集、指针接收者、断言和常见坑分别是什么？
 
 **答案：**
 
@@ -2489,7 +2489,7 @@ fmt.Println(err == nil) // false
 
 ---
 
-### 35. nil interface 和 interface{}(nil) 有什么区别？
+### 49. nil interface 和 interface{}(nil) 有什么区别？
 
 **答案：**
 
@@ -2500,7 +2500,7 @@ fmt.Println(err == nil) // false
 
 ---
 
-### 38. panic 和 recover 应该怎么理解？
+### 50. panic 和 recover 应该怎么理解？
 
 **答案：**
 
@@ -2511,7 +2511,7 @@ fmt.Println(err == nil) // false
 
 ---
 
-### 39. init 函数的执行时机和顺序是什么？
+### 51. init 函数的执行时机和顺序是什么？
 
 **答案：**
 
@@ -2522,7 +2522,7 @@ fmt.Println(err == nil) // false
 
 ---
 
-### 42. Go 里常见的闭包陷阱是什么？为什么 `for` 循环里最容易踩坑？
+### 52. Go 里常见的闭包陷阱是什么？为什么 `for` 循环里最容易踩坑？
 
 **答案：**
 
@@ -2553,7 +2553,7 @@ for i := 0; i < 3; i++ {
 
 ---
 
-### 44. 业务里应该返回 `error` 还是直接 `panic`？怎么取舍？
+### 53. 业务里应该返回 `error` 还是直接 `panic`？怎么取舍？
 
 **答案：**
 
@@ -2565,7 +2565,7 @@ for i := 0; i < 3; i++ {
 
 ---
 
-### 48. `interface`、`any` 与泛型应该怎样理解？
+### 54. `interface`、`any` 与泛型应该怎样理解？
 
 **答案：**
 
@@ -2617,7 +2617,7 @@ func Join[T Stringer](items []T) string { /* ... */ return "" }
 
 ---
 
-### 49. 出现 `panic` 时怎样捕获？
+### 55. 出现 `panic` 时怎样捕获？
 
 **答案：**
 
