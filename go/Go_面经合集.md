@@ -1,7 +1,7 @@
 # 后端/后台开发面经合集 - Go模块（答案版）
 
 > 数据来源：牛客网、Go语言中文网等中文求职社区
-> 由 面经合集_答案版.md 按主题拆分整理
+> 由 面经合集.md 按主题拆分整理
 
 ---
 
@@ -321,6 +321,8 @@ v2, ok2 := <-ch // v2=0, ok2=false
 - 只有发送方关闭channel
 - 使用`for range`遍历channel，自动处理关闭
 - 使用`select + default`进行非阻塞操作
+
+**追问：关闭后会立刻被 GC 回收吗？** 不会。`close` 只改变 channel 的关闭状态并唤醒等待者，不会释放 channel 本身。只有没有任何 goroutine、变量、闭包或其他对象再引用它时，GC 才会在之后的某一轮回收它；缓冲区中尚未读出的元素也会继续保留，直到被读出或整个 channel 不再可达。
 
 ---
 
@@ -2190,61 +2192,45 @@ go mod edit -replace github.com/old=../local/path
 
 ---
 
-### 44. Go的反射机制是什么？运行时是如何实现的？
+### 44. Go 的反射机制是什么？怎么用？
 
-**答案：**
+反射让程序在运行时查看类型、字段、方法和值。核心入口是：
 
-**核心概念：**
+- `reflect.TypeOf(x)`：看类型信息，如 `Kind`、字段、方法、tag。
+- `reflect.ValueOf(x)`：读值、调用方法；需要修改时还要满足“可设置”。
 
-- `reflect.Type`：类型信息
-- `reflect.Value`：值信息
-
-**基本使用：**
+**最常见的规则：要修改原变量，必须传指针，再调用 `Elem()`。**
 
 ```go
-var x float64 = 3.14
-
-// 获取类型
-t := reflect.TypeOf(x)  // float64
-fmt.Println(t.Kind())   // float64
-
-// 获取值
-v := reflect.ValueOf(x)
-fmt.Println(v.Float())  // 3.14
-
-// 修改值（需要传指针）
-p := reflect.ValueOf(&x).Elem()
-p.SetFloat(2.71)
-```
-
-**运行时实现：**
-
-```go
-// interface的内部结构
-type iface struct {
-    tab  *itab          // 类型信息
-    data unsafe.Pointer // 数据指针
+type User struct {
+    Name string
+    Age  int
 }
 
-type eface struct { // 空接口
-    _type *_type        // 类型信息
-    data  unsafe.Pointer
+func setStringField(dst any, field, value string) error {
+    v := reflect.ValueOf(dst)
+    if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+        return fmt.Errorf("dst must be a pointer to struct")
+    }
+
+    f := v.Elem().FieldByName(field)
+    if !f.IsValid() || !f.CanSet() || f.Kind() != reflect.String {
+        return fmt.Errorf("field cannot be set")
+    }
+    f.SetString(value)
+    return nil
 }
+
+u := User{Age: 18}
+_ = setStringField(&u, "Name", "Sky")
+// u.Name == "Sky"
 ```
 
-反射通过解析interface的`_type`字段获取类型信息。
+如果传 `u` 而不是 `&u`，`reflect.ValueOf(u)` 拿到的是一份不可设置的值，`SetString` 会 panic。`CanSet`、`IsValid` 和 `Kind` 是反射代码里最该先检查的三个条件。
 
-**常见使用场景：**
+运行时层面，`TypeOf` / `ValueOf` 的参数会先放进 interface；interface 带有动态类型和数据，反射据此取得类型描述和底层值。业务代码不应依赖 `iface`、`eface` 等运行时内部结构，它们不是稳定 API。
 
-- JSON序列化/反序列化
-- ORM框架
-- 依赖注入
-- 通用函数（如fmt.Printf）
-
-**性能影响：**
-
-- 反射操作比直接操作慢100-1000倍
-- 避免在热路径中使用
+反射适合 JSON 编解码、ORM、配置绑定、通用校验等“类型在编译期未知”的边界代码。它会带来动态检查、间接访问和潜在分配，且不容易被内联；热路径优先用普通代码、接口或泛型。反射的价值是通用性，不是性能。
 
 ---
 
@@ -2294,9 +2280,11 @@ func safe() {
 
 **执行时机：**
 
-1. 函数return前执行defer
-2. panic时执行defer
-3. os.Exit()不会执行defer
+1. `return expr` 会先计算 `expr` 并写入返回值，随后执行 defer，最后真正返回。因此 defer 可以修改**命名返回值**。
+2. `panic` 向上展开栈时，也会执行已经注册的 defer。
+3. `os.Exit()` 会直接结束进程，不会执行 defer。
+
+`recover` 用于捕获 panic，但必须由当前 goroutine 的 deferred function 直接调用才有效。它不能捕获别的 goroutine 的 panic，也不应代替普通 `error`。
 
 ---
 
@@ -2379,6 +2367,32 @@ var _ Notifier = EmailNotifier{} // 编译期检查：改方法签名会直接�
 ```
 
 调用方依赖 `Notifier`，测试时可以传 fake/mock，实现从邮件替换为短信、站内信时不必修改业务函数。这就是接口最常见的价值：隔离变化、方便替换和测试。
+
+#### 补充：Go、Java、C++ 的多态分别怎么实现？
+
+它们的共同点都是“调用方依赖抽象，运行时根据对象真实类型调用对应实现”，但写法不同：
+
+| 语言 | 常见写法 | 动态派发条件 |
+| --- | --- | --- |
+| Go | interface + 隐式实现 | 具体值放入接口后，调用接口方法 |
+| Java | interface / abstract class + 继承 | 普通实例方法默认可虚调用；`final`、`static` 不参与多态 |
+| C++ | 基类指针/引用 + `virtual` 函数 | 只有标记 `virtual` 的函数才走动态绑定 |
+
+```go
+type Animal interface{ Speak() string }
+type Dog struct{}
+type Cat struct{}
+
+func (Dog) Speak() string { return "wang" }
+func (Cat) Speak() string { return "miao" }
+
+func greet(a Animal) { fmt.Println(a.Speak()) }
+
+greet(Dog{}) // wang
+greet(Cat{}) // miao
+```
+
+Go 没有类继承和 `implements` 关键字，`Dog`、`Cat` 只要方法签名匹配就自动实现 `Animal`；接口变量保存动态类型和值，调用 `Speak` 时会分派到对应实现。Java 更常通过继承层级表达复用；Go 更倾向组合加小接口。C++ 若忘记写 `virtual`，即使用基类指针调用也可能静态绑定到基类实现，这是它和 Java/Go 的常见区别。
 
 #### 一、接口应由消费者定义，并保持最小
 
@@ -2515,10 +2529,15 @@ fmt.Println(err == nil) // false
 
 **答案：**
 
-- Go 会先按依赖顺序初始化包：被依赖的包先初始化，再初始化当前包。
-- 每个包内部会先初始化包级变量，再执行 `init()`。
-- 同一个包可以有多个 `init()`，它们都会执行。
-- 工程里不要依赖复杂的 `init` 顺序，重要初始化更推荐显式调用。
+- Go 先初始化被导入的包，再初始化导入它们的包。因此所有依赖包的变量和 `init()`，都发生在 `main` 包的变量和 `init()` 之前。
+- 一个包内先按依赖关系初始化包级变量，再执行该包的 `init()`；同一个包可以有多个 `init()`，都会执行。
+- 最后才执行 `main.main()`。`main` 包的 `init()` 不是入口函数，它只是最后一个包初始化阶段的一部分。
+
+```text
+pkg C -> pkg B -> main 包变量 -> main.init() -> main.main()
+```
+
+不要把跨文件的 `init` 先后当作业务流程依赖。数据库连接、消费者启动等有失败处理或关闭顺序要求的初始化，放到 `main` 的显式 `New / Start` 调用更清楚，也更容易测试。
 
 ---
 
@@ -2584,6 +2603,8 @@ func printValue(v any) {
 }
 ```
 
+所以 `func f(v any)` 当然可以接收并使用这个参数，但要先想清楚要做什么：只打印或透传时可直接交给 `fmt` / JSON；只接受少数类型时用双值断言或 type switch；如果调用方应提供某个能力，参数应写成小接口；同一算法需要保留类型检查时用泛型。不要因为 `any` 能接所有值，就把业务参数都改成 `any`。
+
 用 `type` 定义的 interface 不是结构体，而是一组**方法契约**；任何类型只要实现了全部方法，就自动满足该接口，无须显式声明。接口的价值是依赖抽象、便于替换实现和测试，并非“所有参数都写 interface”：优先在消费者一侧定义最小接口。
 
 ```go
@@ -2637,5 +2658,23 @@ func safeGo(fn func()) {
 ```
 
 Web 服务通常在 HTTP 中间件做同样的兜底，记录堆栈并返回 500。不要用 `panic/recover` 替代普通的 `error`：参数非法、数据库超时等可预期失败应返回 `error`；只有不变量被破坏等无法安全继续的异常才使用 `panic`。捕获后也应根据业务决定是否告警、停止后续工作或返回错误，不能静默吞掉。
+
+---
+
+### 56. 深拷贝和浅拷贝有什么区别？`map` 属于哪种？
+
+- **浅拷贝**只复制外层变量。字段中的指针、slice、map、channel 等仍指向原来的底层数据。
+- **深拷贝**会连同可变的底层数据一起复制，修改副本不会影响原对象。
+
+`map` 变量本身更像一个指向运行时哈希表的引用。`m2 := m1` 是浅拷贝，两个变量读写的是同一个 map：
+
+```go
+m1 := map[string][]int{"a": []int{1, 2}}
+m2 := m1
+m2["a"] = append(m2["a"], 3)
+// m1["a"] 也变为 [1 2 3]
+```
+
+`maps.Clone(m1)`（或手动遍历）只会复制第一层 map；若 value 是 slice、map 或指针，仍需继续复制这些 value 才算深拷贝。是否需要深拷贝取决于副本之后会不会修改共享的可变数据；只读共享时，浅拷贝更省内存。
 
 ---
