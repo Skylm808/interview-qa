@@ -113,6 +113,46 @@ SET key value NX EX seconds
 SET key value NX PX milliseconds
 ```
 
+### 常用 Redis 命令的时间复杂度速查
+
+> `N` 通常表示一个 key 中元素总数，`M` 表示本次返回、处理或传入的元素数。批量命令要把参数个数也算进去。复杂度低不代表一定安全：一次返回几 MB 数据、传入几万个参数，同样会占用 Redis 命令执行线程和网络带宽。
+
+| 类型 | 常用命令 | 时间复杂度 | 说明 |
+| --- | --- | --- | --- |
+| String | `GET`、`SET`、`INCR`、`DECR`、`EXPIRE`、`TTL` | `O(1)` | 单个字符串/计数器的典型操作 |
+| String | `MGET`、`MSET` | `O(M)` | `M` 是 key 或键值对数量 |
+| Key | `DEL key [key ...]` | 至少 `O(M)` | 删除复杂对象还可能有释放成本；大 key 优先考虑 `UNLINK` 异步释放 |
+| Hash | `HSET`、`HGET`、`HDEL`、`HEXISTS`、`HINCRBY` | `O(1)`，按 field 计 | 多个 field 时随 field 数增长 |
+| Hash | `HLEN` | `O(1)` | 只取 field 数量 |
+| Hash | `HGETALL`、`HKEYS`、`HVALS` | `O(N)` | N 大时返回包很大，线上慎用 |
+| List | `LPUSH`、`RPUSH`、`LPOP`、`RPOP`、`LLEN` | `O(1)`，按 element 计 | 批量 push/pop 随元素数增长 |
+| List | `LINDEX`、`LRANGE`、`LREM` | `O(N)` 级别 | `LRANGE` 实际与起点偏移和返回数量有关，深分页会慢 |
+| Set | `SADD`、`SREM`、`SISMEMBER`、`SCARD` | `O(1)`，按 member 计 | 适合判重和集合成员操作 |
+| Set | `SMEMBERS` | `O(N)` | 大集合全量返回风险很高 |
+| Set | `SINTER`、`SUNION`、`SDIFF` | 与参与集合总大小相关 | 多个大集合的交并差要限量或异步计算 |
+| Stream | `XADD` | `O(1)`，均摊 | 追加消息；设置近似 `MAXLEN` 也有额外维护成本 |
+| Stream | `XREAD`、`XREADGROUP` | `O(M)` | M 为实际读取消息数，`BLOCK` 只增加等待时间，不代表 CPU 一直忙 |
+
+#### ZSet 高频命令：排行榜、延迟队列最常用
+
+| 命令 | 时间复杂度 | 常见用途 |
+| --- | --- | --- |
+| `ZADD key score member` | 单个 member 为 `O(log N)`；批量为 `O(M log N)` | 新增或更新积分、时间戳 |
+| `ZINCRBY key increment member` | `O(log N)` | 点赞数、热度分累加 |
+| `ZSCORE key member` | `O(1)` | 查某个成员的分数 |
+| `ZRANK` / `ZREVRANK` | `O(log N)` | 查正序/倒序排名 |
+| `ZCARD` | `O(1)` | 查成员总数 |
+| `ZRANGE` / `ZREVRANGE` | `O(log N + M)` | 取某个排名区间，例如 Top 10 |
+| `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` | `O(log N + M)` | 按分数或时间范围取数据 |
+| `ZCOUNT key min max` | `O(log N)` | 统计一个分数区间的成员数 |
+| `ZREM key member` | 单个 member 为 `O(log N)`；批量为 `O(M log N)` | 移除过期任务或下榜成员 |
+| `ZPOPMIN` / `ZPOPMAX` | `O(M log N)` | 取出并删除最小/最大分数的 M 个成员 |
+| `ZSCAN` | 单次调用 `O(1)`；完整遍历 `O(N)` | 增量扫描，避免一次 `ZRANGE 0 -1` |
+
+例如排行榜取前 10 名：`ZREVRANGE leaderboard 0 9 WITHSCORES` 的 `M=10`，复杂度约为 `O(log N + 10)`；但把 `0 999999` 当分页接口就会随返回量变大。延迟队列常用 `ZADD delay_queue execute_at task_id` 写入，再用 `ZRANGEBYSCORE delay_queue -inf now LIMIT 0 100` 每次取一小批到期任务，处理成功后 `ZREM`。
+
+**遍历类命令的区别：** `KEYS` 是 `O(N)` 且一次扫描全库，不应在生产大实例执行；`SCAN` / `HSCAN` / `SSCAN` / `ZSCAN` 把工作拆成多次调用，单次较轻，但完整遍历仍然是 `O(N)`，还要接受迭代期间可能重复或漏看瞬时变动数据。
+
 ## 基础命令与数据结构
 
 ### 1. Redis 为什么快？是单线程还是多线程？多线程体现在哪里？
