@@ -819,16 +819,29 @@ func (l *SafeList) Append(x int) {
 - 手写双向链表：`head`、`tail` 是哨兵节点，队头是最新、队尾是最旧；
 - `sync.Mutex`：保护 map 和链表这两个必须同步更新的共享结构。
 
-注意 `Get` 虽然逻辑上是读，却会把节点移动到队头，所以不能只拿 `RLock`。下面是在原有实现上补充互斥锁和容量保护后的版本：
+带 TTL（Time To Live，存活时间）时，每个节点再记录一个过期时间 `expireAt`。本题约定：
+
+- `ttl > 0`：`now + ttl` 时过期；
+- `ttl == 0`：`expireAt` 保持零值，表示永不过期；
+- `ttl < 0`：调用参数非法，返回错误。若希望立即删除，直接调用 `Delete`，不要用负 TTL 表达。
+
+这不是 Go 的固定规则，而是缓存 API 的设计约定。`time.Duration` 本身不带“永不过期”语义；例如直接执行 `time.Now().Add(0)` 得到的是“现在”，会立刻过期。因此要显式用零值 `time.Time` 表示“无过期时间”。
+
+注意 `Get` 虽然逻辑上是读，却会把节点移动到队头，也可能删除过期节点，所以不能只拿 `RLock`。关键是：**先判断是否过期，过期就从 map 和链表同时删除；确认有效后才移动到队头。**
 
 ```go
 package lru
 
-import "sync"
+import (
+	"errors"
+	"sync"
+	"time"
+)
 
 type DlistNode struct {
-	key, val   int
-	prev, next *DlistNode
+	key, val      int
+	expireAt      time.Time // 零值表示永不过期
+	prev, next    *DlistNode
 }
 
 type LRUCache struct {
@@ -851,36 +864,89 @@ func Constructor(capacity int) LRUCache {
 	}
 }
 
-func (c *LRUCache) Get(key int) int {
+// Get 返回 value, ok。ok=false 既可能是不存在，也可能是已过期。
+func (c *LRUCache) Get(key int) (int, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	node, exists := c.cache[key]
 	if !exists {
-		return -1
+		return 0, false
 	}
+	if c.expired(node, time.Now()) {
+		c.remove(node)
+		delete(c.cache, key)
+		return 0, false
+	}
+
 	c.moveFront(node)
-	return node.val
+	return node.val, true
 }
 
+// Put 保留不带 TTL 的用法：0 表示永不过期。
 func (c *LRUCache) Put(key, value int) {
+	_ = c.PutWithTTL(key, value, 0)
+}
+
+// PutWithTTL 覆盖已有 key 时，也会更新其过期时间。
+func (c *LRUCache) PutWithTTL(key, value int, ttl time.Duration) error {
+	if ttl < 0 {
+		return errors.New("ttl must be >= 0")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.capacity <= 0 {
-		return
+		return nil
+	}
+	expireAt := time.Time{}
+	if ttl > 0 {
+		expireAt = time.Now().Add(ttl)
 	}
 	if node, exists := c.cache[key]; exists {
 		node.val = value
+		node.expireAt = expireAt
 		c.moveFront(node)
-		return
+		return nil
 	}
 	if len(c.cache) >= c.capacity {
 		c.removeLast()
 	}
-	node := &DlistNode{key: key, val: value}
+	node := &DlistNode{key: key, val: value, expireAt: expireAt}
 	c.cache[key] = node
 	c.addToFront(node)
+	return nil
+}
+
+func (c *LRUCache) Delete(key int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if node, ok := c.cache[key]; ok {
+		c.remove(node)
+		delete(c.cache, key)
+	}
+}
+
+func (c *LRUCache) expired(node *DlistNode, now time.Time) bool {
+	return !node.expireAt.IsZero() && !now.Before(node.expireAt)
+}
+
+// DeleteExpired 适合由后台定时任务调用，返回本次清掉的数量。
+func (c *LRUCache) DeleteExpired() (removed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, node := range c.cache {
+		if c.expired(node, now) {
+			c.remove(node)
+			delete(c.cache, key)
+			removed++
+		}
+	}
+	return removed
 }
 
 func (c *LRUCache) moveFront(node *DlistNode) {
@@ -911,11 +977,19 @@ func (c *LRUCache) removeLast() {
 }
 ```
 
-`Mutex` 的好处是语义清晰：map、链表移动、淘汰始终是一个原子临界区。`remove`、`addToFront` 等辅助方法只在已经持锁的 `Get` / `Put` 内调用，不单独加锁，避免重复加锁。若容量很大且并发极高，可进一步考虑分片 LRU 或专门缓存库；单纯换成 `RWMutex` 并不能让 `Get` 并发，因为 `Get` 仍会修改链表。
+#### 为什么要在 `Get` 里删除过期键？这是不是惰性删除？
+
+是。这叫**惰性删除**：访问某个键时才检查它是否过期，若过期就删掉并当作缓存未命中。这样不需要为每个 TTL 单独启动定时器，正常读写开销小；并且如果不删，过期节点还会被移动到队头，不仅可能读到旧数据，也会继续占用缓存容量。
+
+惰性删除的缺点是：**长期不访问的过期键不会被 `Get` 触发清理。**在这份纯惰性实现里，它会一直留在 map 和链表中、占用内存与容量，直到后续被访问、被 LRU 淘汰，或进程退出；不会自动被 Go GC 回收，因为 map 仍引用着节点。
+
+实际缓存通常采用“惰性删除 + 定期删除”：读路径按需删，后台每隔一段时间调用 `DeleteExpired` 清理冷数据。上面的 `DeleteExpired` 一次扫描是 `O(n)`，大缓存不宜频繁全量扫描；可改成分批扫描，或用最小堆、时间轮按到期时间调度。
+
+`Mutex` 的好处是语义清晰：map、链表移动、淘汰始终是一个原子临界区。`remove`、`addToFront` 等辅助方法只在已经持锁的 `Get` / `PutWithTTL` 内调用，不单独加锁，避免重复加锁。若容量很大且并发极高，可进一步考虑分片 LRU 或专门缓存库；单纯换成 `RWMutex` 并不能让 `Get` 并发，因为 `Get` 仍会修改链表。
 
 **面试回答：**
 
-> LRU 用哈希表加双向链表实现，哈希表 `O(1)` 找节点，链表 `O(1)` 把节点提到队头或淘汰队尾。线程安全时，map 和链表必须在同一把锁保护下；特别是 `Get` 会更新访问顺序，所以也是写操作，不能只用读锁。插入超过容量时删掉队尾节点，并同步从 map 删除。
+> LRU 用哈希表加双向链表实现，查找、移动和淘汰都是 `O(1)`。带 TTL 时节点记录过期时间；`Get` 必须先检查并删除过期节点，再更新访问顺序，因此也是写操作，和 `Put` 一样用同一把锁保护 map 与链表。`Get` 时删除属于惰性删除，冷门过期键可能长期占内存，所以生产中通常再配合定期清理。TTL 的零和负值必须由 API 明确约定；这里 `0` 表示永不过期，负值直接报错。
 
 ---
 
