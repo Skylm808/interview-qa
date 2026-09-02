@@ -5,6 +5,40 @@
 
 ---
 
+## 先建立一张 Go 后端运行全景图
+
+写 Go 后端时，业务代码并不是直接跑在 OS 线程上，而是由 Go runtime 把大量 goroutine 调度到较少的线程执行；网络、定时器、内存和 GC 也都由 runtime 协同管理。
+
+~~~text
+                         Go 进程
+┌────────────────────────────────────────────────────┐
+│  业务 goroutine：HTTP 请求、RPC、worker、定时任务    │
+└──────────────────────┬─────────────────────────────┘
+                       │  创建 / 阻塞 / 唤醒
+                       ▼
+┌────────────────────────────────────────────────────┐
+│  Go runtime                                         │
+│  GMP 调度器：G（任务） -> P（调度资源） -> M（OS 线程）│
+│  网络轮询器：epoll / kqueue / IOCP，等待网络 IO       │
+│  内存与 GC：分配堆内存、标记清扫、回收对象            │
+│  Timer、channel、mutex、栈管理、panic/recover        │
+└──────────────────────┬─────────────────────────────┘
+                       ▼
+              Operating System（线程、网络、内存）
+~~~
+
+**用一个 HTTP 请求串起来：**
+
+1. 客户端连接到来，netpoller（网络轮询器）通过 epoll/kqueue 等机制发现“连接可读”，唤醒对应 goroutine；不需要一个连接占一个 OS 线程。
+2. GMP 调度器让某个 P 从本地队列取出这个 G，由绑定 P 的 M 真正执行 handler。
+3. handler 查 DB、调 RPC 或等待 channel 时，G 会让出执行权；M 可以继续跑别的 G。若是网络等待，G 挂到 netpoller；若是 time.Sleep/超时，则挂到 Timer。
+4. handler 分配 map、slice、对象时，runtime 的内存分配器先从本地缓存等位置分配；堆增长到目标后，GC 并发标记、清扫不再可达的对象。
+5. handler 正常 return 后 G 结束；若发生 panic，会沿 defer 链展开，最近的 recover 可以接住，否则 runtime 终止该 goroutine，未恢复的 main goroutine panic 会使进程退出。
+
+**一句话记忆：** G 是业务任务，P 是运行 Go 代码所需的调度资源，M 是 OS 线程；netpoller 解决大量网络等待，GC 管堆内存，channel/mutex/timer 负责 goroutine 的同步和唤醒。下面的题目再分别展开每一部分。
+
+---
+
 ## Goroutine、GMP 与调度
 
 ### 1. Goroutine和线程有什么区别？Go为什么能实现高并发？
