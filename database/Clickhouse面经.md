@@ -748,15 +748,33 @@ ClickHouse 就不读其他列，比如：
 
 ### 9.4 数据跳过索引
 
-ClickHouse 支持额外的数据跳过索引。
+数据跳过索引（skipping index）不会像 MySQL B+Tree 那样定位某一行；它只回答：**这一整块数据有没有必要读？**如果答案是“肯定不可能满足条件”，ClickHouse 就直接跳过这一块。
 
-比如 MinMax 索引：
+比如给 `amount` 加 MinMax 索引：
 
 ```sql
 INDEX idx_amount amount TYPE minmax GRANULARITY 4
 ```
 
-它会记录某些数据块里 `amount` 的最小值和最大值。
+这行可以拆开看：
+
+- `idx_amount`：索引名。
+- `amount`：要为哪个列（或表达式）建立索引。
+- `TYPE minmax`：每个索引块只保存 `amount` 的**最小值和最大值**。
+- `GRANULARITY 4`：一条 MinMax 索引记录覆盖 **4 个主键 granule**，不是 4 行数据。若表使用默认 `index_granularity = 8192`，则一条记录大约汇总 `4 × 8192 = 32768` 行。
+
+可以这样理解：
+
+```text
+数据 part
+├─ 主键 granule 1：约 8192 行
+├─ 主键 granule 2：约 8192 行
+├─ 主键 granule 3：约 8192 行
+├─ 主键 granule 4：约 8192 行
+│  └─ 一条 minmax 记录：min = 20, max = 200
+├─ 主键 granule 5：约 8192 行
+└─ ...
+```
 
 如果查询：
 
@@ -764,7 +782,16 @@ INDEX idx_amount amount TYPE minmax GRANULARITY 4
 WHERE amount > 10000
 ```
 
-某个数据块的最大值只有 200，那么这个数据块可以直接跳过。
+第一块的 `max = 200`，所以其中不可能有 `amount > 10000` 的行，整块直接跳过；若某块是 `min = 8000, max = 12000`，它**可能**命中，仍要读取实际列数据再逐行过滤。它只负责排除“不可能命中”的块，不保证命中就有结果。
+
+`GRANULARITY` 是精度与开销的取舍：
+
+- 值小（例如 `1`）：每个主键 granule 都单独记录最小 / 最大值，跳过更精细，但索引更大、维护成本更高。
+- 值大：索引更小，但一条记录覆盖行数更多，`min` / `max` 范围更容易变宽，跳过效果变差。
+
+MinMax 最适合数据按该列或与该列强相关的字段有序 / 成簇的场景，例如时间、价格区间、递增 ID。若 `amount` 在每个块里都随机分布在很大范围，几乎每块都会同时出现小值和大值，`minmax` 就很难跳过数据。
+
+**一句话记忆：**`minmax` 记录一块数据的值域；查询条件与这个值域完全不相交，ClickHouse 才能跳过该块；`GRANULARITY 4` 表示一条索引记录合并看 4 个基础 granule。
 
 ---
 
