@@ -2346,9 +2346,60 @@ LIMIT 20;
 
 若产品必须支持“跳到第 N 页”，可考虑**延迟关联**：内层先用覆盖索引只取这一页的 `id`，外层再按这 20 个 `id` 回表取完整行。它仍需扫描前面的索引项，但把大量回表缩小到当前页；随机跳页很频繁时，则更适合预计算页锚点、改用搜索引擎或重新评估交互设计。
 
+**MySQL 真遇到深分页时，按这个顺序处理：**
+
+1. **连续翻页：改游标分页，优先级最高。**
+
+   例如列表按创建时间倒序展示，使用上页最后一条的 `(created_at, id)` 作为游标，并建立匹配的联合索引：
+
+   ```sql
+   -- 索引：INDEX idx_created_id (created_at, id)
+   SELECT *
+   FROM orders
+   WHERE (created_at, id) < (?, ?)
+   ORDER BY created_at DESC, id DESC
+   LIMIT 20;
+   ```
+
+   `id` 用来打破相同时间戳的并列，保证顺序稳定；只有 `created_at` 时，新增数据或同一时间的多条记录可能造成重复或漏读。若前面还有等值过滤条件，例如 `status = 'PAID'`，索引通常应为 `(status, created_at, id)`。
+
+2. **必须跳到指定页：用延迟关联减少回表。**
+
+   ```sql
+   SELECT o.*
+   FROM orders AS o
+   JOIN (
+       SELECT id, created_at
+       FROM orders
+       WHERE status = 'PAID'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1000000, 20
+   ) AS page ON page.id = o.id
+   ORDER BY page.created_at DESC, page.id DESC;
+   ```
+
+   为内层准备 `(status, created_at, id)` 覆盖索引。这样仍需在索引里跳过前 100 万项，但只对当前页约 20 条记录回表；它是“减轻”，不是让大 `OFFSET` 变成 `O(1)`。
+
+3. **页面本身不该支持无限跳页：限制产品语义。**
+
+   列表 UI 通常只提供“下一页 / 上一页”或限定最大页数。若运营后台确实要频繁随机跳页，可预计算每隔一段的页锚点，使用搜索引擎的 `search_after` / PIT，或按时间分区、日期筛选后再分页。
+
+4. **批量导出 / 离线处理：按主键范围分批，不要用 OFFSET 循环。**
+
+   ```sql
+   SELECT * FROM orders
+   WHERE id > ?
+   ORDER BY id
+   LIMIT 1000;
+   ```
+
+   每批记录最后一个 `id` 作为下一批起点。对于会更新排序字段的数据，应固定导出时间窗口或快照边界，否则翻页过程中数据变化仍会造成重读或漏读。
+
+无论采用哪种方式，都要用 `EXPLAIN ANALYZE` 验证扫描行数、是否回表和是否 `filesort`；只加一个主键索引并不能解决 `LIMIT 1000000, 20`，因为它仍然要沿索引遍历并丢弃前 100 万条。
+
 **面试回答：**
 
-> `LIMIT offset, size` 的成本不是 `size`，而是至少要跳过 `offset` 条符合条件的数据。主键索引按主键顺序扫，通常要扫 `offset + size` 条；二级索引也是这个量级，`SELECT *` 还可能对大量跳过记录回表；无索引且要排序时，往往要扫完候选集再排序。深分页优先改成基于主键或 `(created_at, id)` 的游标分页，必须随机跳页时再用延迟关联减少回表。
+> `LIMIT offset, size` 的成本不是 `size`，而是至少要跳过 `offset` 条符合条件的数据。主键索引按主键顺序扫，通常要扫 `offset + size` 条；二级索引也是这个量级，`SELECT *` 还可能对大量跳过记录回表；无索引且要排序时，往往要扫完候选集再排序。连续翻页优先用主键或 `(created_at, id)` 游标分页；必须跳页时用延迟关联减少回表，但它不能消除 offset 扫描；批量导出则按主键范围分批。
 
 ---
 
