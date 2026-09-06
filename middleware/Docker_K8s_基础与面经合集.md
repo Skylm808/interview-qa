@@ -6,36 +6,19 @@
 
 ---
 
-## 一、先建立最小认知地图
-
-### 1. 先一句话理解 Docker 和 K8s
-
-- **Docker**：解决“应用怎么打包、怎么在不同环境里一致运行”。
-- **Kubernetes / K8s**：解决“很多容器怎么批量部署、调度、扩缩容、服务发现和自愈”。
-
-你可以先把它们理解成：
+## 一、阅读顺序：先 Docker，后 Kubernetes，再做面试题
 
 ```text
-Docker = 把应用装进标准集装箱
-K8s    = 管很多集装箱的大型调度系统
+Docker：应用 + Dockerfile -> Image -> Registry -> Container -> Volume
+K8s：Node / Control Plane -> Pod -> Deployment -> Service / Ingress
+                                 -> ConfigMap / Secret / PV / PVC
+                                 -> Scheduler / kubelet / CNI / CSI
 ```
 
----
+- **Docker** 解决“应用如何连同依赖被一致地构建、分发和运行”。
+- **Kubernetes（K8s）** 解决“许多容器如何部署、调度、扩缩容、联网、存储与自愈”。
 
-### 2. 你现在最容易混淆的几个概念
-
-| 概念               | 一句话理解                           |
-| ---------------- | ------------------------------- |
-| **镜像 Image**     | 应用运行模板，里面有代码、运行时、依赖、配置          |
-| **容器 Container** | 镜像运行起来后的实例                      |
-| **仓库 Registry**  | 存镜像的地方，比如 Docker Hub、Harbor     |
-| **Pod**          | K8s 里最小调度单元，通常装一个主容器，也可以多个容器一起跑 |
-| **Deployment**   | 管一组 Pod，负责副本数、滚动更新、回滚           |
-| **Service**      | 给 Pod 提供稳定访问入口                  |
-| **Ingress**      | 负责外部 HTTP/HTTPS 流量进集群后的路由       |
-| **Node**         | K8s 集群中的机器                      |
-| **Namespace**    | 资源隔离视图，不是强安全边界                  |
-| **PV / PVC**     | 持久化存储资源和存储申请单                   |
+因此不要先背 K8s 名词：先弄清镜像和容器，再理解 Pod 为什么是调度单位，最后才看 Deployment、Service 和节点组件。
 
 ---
 
@@ -575,6 +558,45 @@ PVC = 你提交的领货单
 StorageClass = 货物类别 / 供货规则
 ```
 
+### 9. 一个 Pod 怎样从 YAML 变成真正运行的容器？
+
+这条链路把前面的组件串起来：
+
+```text
+客户端 / Controller
+  -> API Server（认证、鉴权、准入校验）
+  -> etcd（持久化期望状态；Pod 尚未绑定 Node）
+  -> Scheduler（按 requests、可用资源、亲和/反亲和、污点容忍等过滤和打分）
+  -> 写回 Pod.spec.nodeName
+  -> 目标 kubelet（watch 到分配给本机的 Pod）
+  -> CRI / container runtime（创建 Pod sandbox、拉镜像、创建容器）
+  -> CNI（创建网络命名空间、配置网卡 / IP / 路由）
+  -> CSI（若使用 PVC，则挂载存储卷）
+  -> 探针通过；readiness 就绪后才接入 Service 流量
+```
+
+- `scheduler` 只选 Node，不负责拉镜像或启动容器；节点执行者是 `kubelet`。
+- `CRI` 是 kubelet 与 containerd、CRI-O 等 container runtime 的接口。
+- `CNI` 管网络，`CSI` 管存储；CSI 仅在需要卷时参与，二者不能混为一谈。
+
+### 10. Pod 的 CPU、内存怎样隔离？
+
+完整路径是：**`requests / limits → scheduler → kubelet / runtime → Linux cgroups`。**
+
+- `requests` 是调度预留量。Scheduler 将一个 Pod 中各容器的 request 汇总，只有 Node 剩余可分配资源足够才会放置它；CPU request 在竞争时通常对应更高的 CPU 时间权重。
+- `limits` 是运行上限。kubelet 将数值交给 runtime，Linux 节点一般由 cgroups 执行：CPU 到上限会被 throttling；内存超过 limit 时，内存压力下可能被 OOM Kill。
+- 例如 `request: 500m / 512Mi`、`limit: 1 CPU / 1Gi`：调度需要节点至少有 0.5 核和 512Mi 余量；运行时超过 1 CPU 会被限速，内存失控则可能被杀后重启。
+
+这里的 Linux `namespace` 解决“进程能看见哪些 PID、网络、挂载点”；`cgroups` 解决“最多能用多少 CPU、内存、IO”。不要把它和 Kubernetes Namespace（API 对象的逻辑管理边界）混为一谈。
+
+### 11. CNI、CSI 和 RuntimeClass 分别解决什么？
+
+- `CNI`：给 Pod 配网络，如网卡、IP、路由与网络策略落地。
+- `CSI`：让 PVC 对接云盘、NFS、Ceph 等存储，并完成挂载。
+- `RuntimeClass`：为 Pod 选择不同 container runtime 配置；需要更强隔离的工作负载可以选择基于轻量虚拟化或 sandbox 的运行时，调度器也能计入额外开销。
+
+它们分别位于网络、存储和运行时隔离三层，不能把“装了 CSI”理解成网络打通，或把“用了容器”理解成天然强安全隔离。
+
 ---
 
 ## 四、你现在会用 kubectl，但要知道它到底在做什么
@@ -605,83 +627,71 @@ StorageClass = 货物类别 / 供货规则
 
 ---
 
-## 五、大厂很爱问的 Docker / K8s 问题（适合新手版）
+## 五、高频面试题：用基础知识组织成短答
 
-### 1. Docker 和虚拟机的区别是什么？
+> 第二、三章负责把概念讲透；本章不再重复教材，而是给出面试时的回答顺序、易错点和进阶追问。复习时先读基础，再用这一章自测。
 
-**答案：**
+### A. Docker 与容器
 
-虚拟机是虚拟出一整套硬件和 Guest OS，隔离强但开销大；容器本质上还是宿主机上的进程，主要通过 namespace 和 cgroup 做隔离与资源限制，启动快、资源利用率高。\
-一句话就是：**虚拟机隔离的是机器，容器隔离的是进程。**
-
----
-
-### 2. Docker 是怎么实现轻量级隔离的？
+#### 1. Docker 和虚拟机的区别是什么？
 
 **答案：**
 
-核心靠两类 Linux 机制：
-
-- `namespace`：隔离进程视图，比如 PID、网络、挂载点、用户空间
-- `cgroup`：限制资源，比如 CPU、内存、磁盘 IO
-
-所以标准答法是：
-
-> Docker 容器本质上是宿主机上的一组特殊进程，namespace 负责隔离，cgroup 负责资源限制。
+先讲边界：VM 虚拟硬件并带自己的 Guest OS / 内核，隔离更强但重；容器是共享宿主机内核的一组受限进程，启动更快、密度更高。再补取舍：运行不可信代码或多租户 Agent 时，容器外可再选择 microVM / Sandbox；代价是启动与资源开销，收益是更强的宿主机隔离。详细的 namespace、cgroups 与 RuntimeClass 已在前文基础部分说明。
 
 ---
 
-### 3. 镜像和容器的区别是什么？
+#### 2. Docker 是怎么实现轻量级隔离的？
 
 **答案：**
 
-镜像是只读模板，容器是镜像运行起来后的实例。镜像里有应用和依赖，容器里则有运行时状态和可写层。
+先给结论：容器仍是宿主机进程，**namespace 管“看见什么”，cgroups 管“最多用多少”**。追问时再举 PID / Network namespace 和 CPU / 内存配额的例子；安全边界还需叠加最小权限、seccomp、AppArmor / SELinux、只读文件系统和网络策略，不能只说“有容器就安全”。
 
 ---
 
-### 4. Pod 和容器的关系是什么？
+#### 3. 镜像和容器的区别是什么？
 
 **答案：**
 
-Pod 是 K8s 最小调度单元，里面可以有一个或多个容器。多个容器共享同一个网络命名空间和 Volume，所以适合把强关联组件放在一个 Pod 里运行。
+镜像是不可变的只读运行模板；容器是镜像启动后的运行实例，带进程、网络和可写层。生产发布应尽量用镜像 digest 锁定版本，不只依赖可变 tag。
 
 ---
 
-### 5. Pod 创建流程怎么讲？
+### B. Kubernetes 核心机制
+
+#### 4. Pod 和容器的关系是什么？
 
 **答案：**
 
-最简化版本你可以这样答：
-
-1. 用户提交 YAML 给 `kube-apiserver`
-2. `apiserver` 写入 `etcd`
-3. `scheduler` 发现有新的 Pod 未绑定节点，选择一个合适的 Node
-4. 目标节点上的 `kubelet` 发现这个 Pod 被分配给自己
-5. `kubelet` 调用容器运行时拉镜像、创建容器、挂载卷、配置网络
-6. Pod 进入运行状态，并持续上报状态
-
-这已经够应对大多数一面。
+Pod 是最小调度单元，通常包含一个主容器，也可包含强关联 sidecar；它们共享 Pod 网络和可共享 Volume。回答时说清“Pod 是调度边界，不等于一个容器”即可。
 
 ---
 
-### 6. Deployment 和 Pod 的关系是什么？
+#### 5. Pod 创建流程怎么讲？
 
 **答案：**
 
-Deployment 不直接跑业务，而是声明“我希望有多少个 Pod、怎么升级、怎么回滚”；底层由 ReplicaSet 帮它维持副本数。  
-所以一般是：**Deployment 管副本和发布，Pod 真正承载容器。**
+按“API Server → etcd → Scheduler → kubelet → runtime → CNI / CSI → probes”复述即可。最容易失分的是说 Scheduler 在节点上创建容器；实际上 Scheduler 只绑定 Node，kubelet 通过 CRI 落实运行。
 
 ---
 
-### 7. Service 为什么存在？
+#### 6. Deployment 和 Pod 的关系是什么？
 
 **答案：**
 
-因为 Pod 是不稳定的，IP 会变、数量会变，不能直接依赖 Pod IP。Service 用来给一组 Pod 提供稳定的访问入口和服务发现能力。
+Deployment 声明副本数与发布策略，底层通过 ReplicaSet 维持 Pod 数量；Pod 才是实际承载容器的单位。回答时可补充滚动升级、暂停与回滚都是 Deployment 层的职责。
 
 ---
 
-### 8. Service 常见类型有哪些？
+#### 7. Service 为什么存在？
+
+**答案：**
+
+Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod，并提供稳定的虚拟 IP / DNS 名称；它解决“稳定访问谁”，不直接替代 Ingress 的 HTTP 路由能力。
+
+---
+
+#### 8. Service 常见类型有哪些？
 
 **答案：**
 
@@ -692,7 +702,7 @@ Deployment 不直接跑业务，而是声明“我希望有多少个 Pod、怎�
 
 ---
 
-### 9. liveness / readiness / startup probe 的区别是什么？
+#### 9. liveness / readiness / startup probe 的区别是什么？
 
 **答案：**
 
@@ -706,7 +716,7 @@ Deployment 不直接跑业务，而是声明“我希望有多少个 Pod、怎�
 
 ---
 
-### 10. OOMKilled 和 CrashLoopBackOff 是什么？
+#### 10. OOMKilled 和 CrashLoopBackOff 是什么？
 
 **答案：**
 
@@ -722,52 +732,120 @@ Deployment 不直接跑业务，而是声明“我希望有多少个 Pod、怎�
 
 ---
 
-### 11. requests 和 limits 是什么？
+#### 11. requests 和 limits 是什么？
 
 **答案：**
 
-- `requests`：调度时保证给你的最小资源
-- `limits`：你最多能用到的上限资源
-
-调度器主要参考 request，运行时限制主要看 limit。
+按“request 决定能否调度，limit 决定运行上限，cgroups 真正执行”回答。CPU 超限通常是 throttling，内存超限风险是 OOM Kill；不要把 Kubernetes Namespace 误说成 Linux namespace 或强安全隔离。数值例子和完整链路见第三章第 10 节。
 
 ---
 
-### 12. Namespace 是什么？是强隔离吗？
+#### 12. Namespace 是什么？是强隔离吗？
 
 **答案：**
 
-Namespace 是 K8s 里的资源隔离视图，用来把同一集群里的资源按环境、团队、项目分开。它是很重要的管理边界，但一般不应简单理解成“强安全隔离”。
+它是 Kubernetes API 对象的逻辑管理边界，可按团队、环境配合 ResourceQuota、RBAC 管理；不是 Linux namespace，也不单独构成强安全隔离。多租户还要结合权限、网络策略、Pod 安全和必要时的强隔离运行时。
 
 ---
 
-### 13. PV / PVC 的关系怎么讲？
+#### 13. PV / PVC 的关系怎么讲？
 
 **答案：**
 
-PV 是真实存储资源，PVC 是存储申请。Pod 通常不是直接绑 PV，而是声明 PVC，再由系统把 PVC 和合适的 PV 绑定。
+PV 是集群可供给的存储资源，PVC 是工作负载的存储申请，Pod 引用 PVC 而非直接绑定底层盘。StorageClass 可提供动态供给策略；三者的类比和基础定义见第三章第 8 节。
 
 ---
 
-### 14. CSI 是什么？
+#### 14. CSI 是什么？
 
 **答案：**
 
-`CSI` 全称是 `Container Storage Interface`，中文可以理解成**容器存储接口标准**。它让 K8s 可以通过统一接口对接不同存储系统。  
-面试里你不用讲太深，知道：**PV/PVC 背后的很多现代存储接入都靠 CSI Driver。**
+CSI 是容器存储接口，Driver 将 PVC 的请求落到具体云盘、NFS、Ceph 等存储，并负责挂载。它与负责 Pod 网络的 CNI 是两条不同链路，见第三章第 11 节。
 
 ---
 
-### 15. kubelet、scheduler、kube-proxy、etcd 分别干什么？
+#### 15. kubelet、scheduler、kube-proxy、etcd 分别干什么？
 
 **答案：**
 
-- `kubelet`：节点上的执行管家
-- `scheduler`：给 Pod 选 Node
-- `kube-proxy`：维护 Service 转发规则
-- `etcd`：保存集群状态
+- `kubelet`：节点执行者，负责让本机 Pod 实际运行并上报状态。
+- `scheduler`：为未绑定 Node 的 Pod 选择合适节点。
+- `kube-proxy`：维护 Service 转发相关规则。
+- `etcd`：控制面的一致性状态存储，不是直接给业务服务做注册发现。
 
-这是非常高频的基础题。
+顺序要讲对：期望状态经 API Server 写入 etcd，Scheduler 绑定 Node，kubelet 再落地运行。
+
+---
+
+### C. AI / 云原生进阶
+
+#### 16. GPU 在 Kubernetes 里怎么调度？和 CPU / 内存有什么区别？
+
+**答案：**
+
+GPU 通常以扩展资源暴露，例如 `nvidia.com/gpu`。节点先安装厂商驱动，再部署厂商的 **Device Plugin**：Plugin 向 kubelet 上报可用设备，kubelet 将其写入 Node 的 `status.allocatable`；Pod 在 `resources.limits` 中申请 GPU 后，Scheduler 像核算 CPU / 内存一样选择还有足够 GPU 的节点。真正落到节点时，Device Plugin 再参与设备分配，container runtime 把对应设备和运行所需配置交给容器。
+
+```text
+GPU 驱动 + Device Plugin
+  -> Node allocatable: nvidia.com/gpu = 8
+  -> Pod limits: nvidia.com/gpu = 1
+  -> Scheduler 选有空闲 GPU 的节点
+  -> kubelet / Device Plugin Allocate
+  -> 容器拿到被分配的 GPU 设备
+```
+
+区别在于：CPU、内存是可按 `500m`、`512Mi` 分割和 cgroups 管控的可压缩资源；普通 GPU 是离散设备，Kubernetes 按整数个扩展资源核算，通常不能超卖，GPU 的 request 和 limit 必须相等。设备是否能分片、如何隔离算力和显存，取决于硬件与厂商插件，不是通用 cgroup CPU 配额。
+
+- **MIG**：支持 MIG 的 GPU 可被划成带独立显存 / 计算配额的硬件实例，并由厂商插件作为不同资源暴露；调度的是某类 MIG 实例，而非整卡。
+- **共享 GPU**：时间切片、显存配额或 MPS 等通常是厂商 / 平台扩展，能提高利用率，但隔离强度、监控和故障影响面要单独评估，不能把它当成标准 Kubernetes 的整卡独占。
+
+官方 GPU 调度依赖 Device Plugin，并要求节点安装厂商驱动和对应插件。[Kubernetes GPU 调度](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
+
+#### 17. 训练任务和在线推理任务在调度上有什么不同？
+
+**答案：**
+
+训练通常是长时间、多 GPU、强通信的批处理任务：要考虑同机 / 同机架亲和性、NVLink / RDMA 拓扑、数据位置，并使用 gang scheduling（成组资源一次满足才启动），否则 8 卡任务只拿到 4 卡会白占资源却无法有效训练。训练更重视吞吐、checkpoint、可恢复和排队公平性。
+
+在线推理更看首 token / P99、可用性和弹性：请求可能很短、负载波动大，常按 QPS、队列长度、GPU 利用率或 KV Cache 水位扩缩；需要模型副本、路由、batching 和限流。它可以容忍小粒度共享或动态批处理，但必须为突发流量预留余量。简记为：**训练追求成组拿齐资源和总吞吐；推理追求低延迟、弹性与稳定服务。**
+
+#### 18. GPU 很贵，怎样提高利用率？
+
+**答案：**
+
+先量化 GPU 利用率、显存利用率、排队时间、空洞资源和单位请求成本，不能只看“集群有多少卡”。常见组合是：
+
+- 建立统一资源池，用队列和优先级让高优在线推理优先，低优训练 / 批任务可抢占或在空闲时运行；
+- 以 GPU 型号、显存、网络拓扑做匹配和 bin packing，减少“任务要 80GB 显存却被放到不合适节点”的碎片；
+- 推理侧做连续 / 动态 batching、模型复用和 KV Cache 管理，提高每次 kernel 执行的有效工作量；
+- 对可分片硬件使用 MIG，或在风险可控时使用时间切片等共享方案；
+- 设置闲置超时回收、checkpoint 与自动暂停，防止 notebook、实验任务长期占卡。
+
+注意：利用率不是越高越好。在线推理把 GPU 压到接近 100% 往往会使排队和 P99 恶化，需为 SLO 留出容量。
+
+#### 19. Serverless AI 为什么会冷启动？怎样优化？
+
+**答案：**
+
+普通函数冷启动已经包括调度、镜像拉取、容器 / runtime 启动；AI 还多了模型权重下载与加载、GPU 分配、CUDA / 推理引擎初始化、KV Cache 预留，因此首请求会明显慢于热实例。
+
+优化要分别处理每一段：镜像做多阶段构建、减小层并使用就近 registry / 节点缓存；预拉镜像、预热节点；权重放本地高速缓存或共享只读缓存；保留少量 warm pool；让模型进程常驻并按模型规格分池；请求侧做排队、并发控制与动态 batch。代价是更高的空闲成本，所以应按流量周期、模型大小和首请求 SLO 设预热容量，而非无限保活。
+
+#### 20. 镜像怎样构建、分发？几千台机器同时拉镜像怎么办？
+
+**答案：**
+
+CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多阶段构建、漏洞扫描和签名；推送到镜像 Registry 后，以 tag 之外的 **digest** 标识确定版本。节点运行时按镜像层拉取并缓存，Deployment 再按策略创建 Pod。
+
+大规模发布不能让数千节点同一时刻直连一个 Registry：会造成 Registry、跨机房带宽和镜像源限流雪崩。可组合使用区域 Registry mirror / pull-through cache、P2P 分发或节点级缓存；先用 DaemonSet 在目标节点预拉热点镜像；分批发布并限制并发拉取；对大镜像使用层复用和懒加载。每层还要校验 digest，失败指数退避，Registry、节点磁盘和拉取时延必须有监控。镜像是包含应用及依赖的可执行软件包，通常先推送 Registry 再由 Pod 引用。[Kubernetes Images](https://kubernetes.io/docs/concepts/containers/images/)
+
+#### 21. 怎样做灰度发布和故障回滚？
+
+**答案：**
+
+先保证版本可追溯：镜像 digest、配置版本、数据库迁移和发布批次都要能定位。发布时可按 1% → 5% → 25% → 100% 的流量或实例比例逐步放量，使用 readiness 确保新 Pod 未就绪前不接流量；按错误率、P99、CPU / 内存、核心业务成功率和业务指标设自动暂停阈值。复杂场景可通过 Ingress / Service Mesh 做按用户、Header、地域或流量比例的 canary，而不是只按 Pod 数量。
+
+发现异常先停止继续放量，切回稳定版本 / 流量；无状态服务可以回滚 Deployment 镜像。若涉及数据库，迁移应优先采用向后兼容的 expand → backfill → contract：新旧版本可同时读写，确认回滚窗口结束后再删除旧字段，不能把不可逆 DDL 和应用全量切换绑成一次操作。
 
 ---
 
@@ -826,6 +904,14 @@ PV 是真实存储资源，PVC 是存储申请。Pod 通常不是直接绑 PV，
    https://kubernetes.io/docs/concepts/storage/persistent-volumes/
 6. Kubernetes Deployments  
    https://v1-33.docs.kubernetes.io/docs/concepts/workloads/controllers/deployment/
+7. Kubernetes Resource Management  
+   https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+8. Kubernetes GPU Scheduling  
+   https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/
+9. Kubernetes Container Runtime Interface  
+   https://kubernetes.io/docs/concepts/containers/cri/
+10. Kubernetes RuntimeClass  
+    https://kubernetes.io/docs/concepts/containers/runtime-class/
 
 ### 公开面经 / 公开讨论（牛客为主）
 
@@ -890,4 +976,4 @@ K8s: Deployment -> ReplicaSet -> Pod -> Service -> Ingress
 - Ingress Controller
 - etcd
 
-如果你现在时间有限，优先把 **第五章的 15 个题 + 第七章的 12 个高频题** 过一遍，收益最高。
+如果时间有限，先过第二章的“容器、镜像、隔离”，再过第三章的“Pod、Deployment、Service、Pod 创建链路、资源隔离”，最后用第五章 B 组的 4～15 题自测；面 AI / Infra 岗再补 C 组的 GPU、冷启动、镜像分发和发布回滚。
