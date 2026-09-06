@@ -1,8 +1,8 @@
-# Docker / Kubernetes（K8s）基础与面经合集（答案版）
+# Docker / Kubernetes（K8s）/ etcd 基础与面经合集（答案版）
 
 > 适用人群：刚接触容器 / K8s 的后端同学。  
 > 你的当前状态我按这个假设来整理：**会用 `kubectl` 连公司集群、能看部署和服务，但还没有系统学过 Docker / K8s 原理。**  
-> 目标：先建立整体地图，再补大厂高频面试题。
+> 目标：先分别理解 Docker、Kubernetes、etcd，再用一条真实部署链路把三者串起来，最后补高频面试题。
 
 ---
 
@@ -13,12 +13,14 @@ Docker：应用 + Dockerfile -> Image -> Registry -> Container -> Volume
 K8s：Node / Control Plane -> Pod -> Deployment -> Service / Ingress
                                  -> ConfigMap / Secret / PV / PVC
                                  -> Scheduler / kubelet / CNI / CSI
+etcd：Kubernetes API 对象的强一致持久化状态存储
 ```
 
 - **Docker** 解决“应用如何连同依赖被一致地构建、分发和运行”。
 - **Kubernetes（K8s）** 解决“许多容器如何部署、调度、扩缩容、联网、存储与自愈”。
+- **etcd** 保存 Kubernetes 控制面认定的集群状态，使多个控制面组件基于同一份事实做收敛。
 
-因此不要先背 K8s 名词：先弄清镜像和容器，再理解 Pod 为什么是调度单位，最后才看 Deployment、Service 和节点组件。
+因此不要先背 K8s 名词：先弄清镜像和容器，再理解 Pod 为什么是调度单位，然后理解 etcd 为什么保存“期望状态”，最后再看控制器怎样收敛它。
 
 ---
 
@@ -324,42 +326,6 @@ K8s 主要解决：
 
 ---
 
-### 2A. etcd 是不是分布式？它在 K8s 里是做服务发现的吗？
-
-可以先记一句：
-
-> **etcd 本身就是分布式强一致 KV（Key-Value，键值）存储，不是项目大才叫分布式；在 K8s 里，它更像“集群总账本”，不是业务直接使用的服务发现组件。**
-
-更准确地说：
-
-- 小环境里 etcd 可能单节点部署
-- 大环境里常见 3 节点 / 5 节点部署
-- 但它的本质定位一直都是分布式一致性存储
-
-在 Kubernetes 里，etcd 主要保存：
-
-- Pod
-- Node
-- Deployment
-- Service
-- Endpoint / EndpointSlice
-- ConfigMap / Secret
-- 其他集群状态
-
-所以它和服务发现的关系是：
-
-- **服务发现依赖的状态数据会存在 etcd 里**
-- 但真正更直接负责服务发现的是：
-  - `Service`
-  - `CoreDNS`
-  - `kube-proxy`
-
-一句压缩版：
-
-> **etcd 是 K8s 的分布式状态存储，不是直接做业务服务发现的；服务发现依赖的状态数据会存到 etcd 里。**
-
----
-
 ### 2. K8s 集群最核心的角色
 
 #### 控制面（Control Plane）
@@ -599,7 +565,124 @@ StorageClass = 货物类别 / 供货规则
 
 ---
 
-## 四、你现在会用 kubectl，但要知道它到底在做什么
+## 四、etcd 基础：Kubernetes 控制面的强一致账本
+
+### 1. etcd 是什么，适合存什么？
+
+etcd 是一个分布式、强一致的键值（Key-Value）存储，适合保存**数据量不一定大、但不能各说各话的元数据**：配置、选主状态、服务实例元信息、锁和集群期望状态。
+
+它不适合替代 MySQL、对象存储或日志系统去承载海量业务明细；Kubernetes 使用它，是因为 Pod、Node、Deployment、Service、Secret 等集群对象必须有可靠、可一致读取的事实来源。
+
+在 Kubernetes 的正常架构里：
+
+```text
+kubectl / Controller / Scheduler / kubelet
+              -> kube-apiserver
+              -> etcd
+```
+
+在**日常 Kubernetes 控制路径**中，`kube-apiserver` 是 etcd 的直接客户端；备份 / 恢复工具是例外，但也应受严格证书与网络边界控制。其他组件通过 API Server 的 API、List / Watch 获取对象并回写状态；不要把 etcd 当成业务服务注册中心，也不要让业务服务绕过 API Server 直接访问它。Service、CoreDNS、kube-proxy 才是服务发现和转发链路中的直接角色。
+
+### 2. etcd 为什么常说是 CP？
+
+CAP 中：
+
+- `C`（Consistency）：写成功后，后续强一致读看到的是同一最新提交结果；
+- `A`（Availability）：每次请求都能获得响应；
+- `P`（Partition Tolerance）：网络分区时系统仍能继续按既定语义工作。
+
+网络分区无法回避。etcd 基于 Raft，在分区时优先守住一致性：写入必须经过 Leader 且得到多数派确认。3 节点集群需要至少 2 个节点形成多数；少数派即使机器还活着，也不能继续提交写入。它牺牲的是这部分场景的可写性，而不是让两边各写一份冲突的集群状态，因此通常称为偏 CP。
+
+### 3. Raft：选主与日志复制怎样保证一致？
+
+Raft 的核心是“一个写入口、一条日志顺序、一个多数派提交规则”。角色有：
+
+- `Follower`：默认角色，接收 Leader 的心跳和日志；
+- `Candidate`：在选举超时未收到心跳时发起竞选；
+- `Leader`：当前处理写请求并复制日志的唯一节点。
+
+```text
+Follower 长时间未收到心跳
+  -> term + 1，成为 Candidate，先投自己
+  -> RequestVote 拉票（候选人的日志不能明显落后）
+  -> 获得多数派投票，成为 Leader
+  -> 定期以 AppendEntries 发送心跳 / 推进日志
+```
+
+客户端写入时，Leader 先追加日志、复制给 Follower；**多数派确认后**才标记 committed，再按相同顺序应用到各节点状态机并返回成功。`term` 是任期编号：旧 Leader 恢复后若发现更大的 term，必须退回 Follower，避免脑裂后继续写。选举超时会随机化，避免所有 Follower 同时竞选造成持续平票。
+
+多数派的关键是“任意两个多数派必有交集”，已提交日志不会被新 Leader 遗失。面试压缩版：**Leader 统一写入顺序，多数派决定提交，term 和日志新旧约束保证新 Leader 不倒退。**
+
+### 4. etcd 的读、Watch、Lease 分别是什么？
+
+- **写：**写入走 Leader，日志多数派确认后提交；强一致读需走线性一致语义，不能把任意本地旧副本的值当成最新值。
+- **Watch：**订阅某个 key 或前缀的变更事件，用事件驱动替代不停轮询。Kubernetes 的控制器就是通过 List + Watch 感知对象变化，再让实际状态向期望状态收敛。
+- **Lease：**给 key 绑定租期并持续 keepalive；客户端失联后 Lease 到期，相关 key 自动删除。它适合临时注册或选主等“实例失联就应自动失效”的状态。
+
+Watch 不是可靠消息队列：消费者要保存 revision，遇到 compaction 或连接中断时重新 List 并从新 revision Watch；事件处理本身也要幂等。
+
+### 5. etcd、ZooKeeper、Redis 怎么选？
+
+- etcd：强一致 KV、Watch、Lease，并与 Kubernetes / 云原生生态贴合；
+- ZooKeeper：经典协调系统，生态成熟；
+- Redis：缓存和高性能数据访问很强，也可实现简单注册 / 锁，但不能因为它快就忽略一致性、故障转移和锁语义。
+
+不要回答“谁绝对更好”。先看目标是强一致协调、生态兼容、吞吐延迟还是实现复杂度；Kubernetes 控制面选择 etcd 的关键是保存一致的集群元数据，不是追求存业务大数据。
+
+---
+
+## 五、把 Docker、Kubernetes、etcd 串起来：部署一个订单 API 的完整例子
+
+假设我们有一个 `order-api`：需要 3 个副本、只接受就绪流量，配置来自 ConfigMap，订单库密码来自 Secret。开发者先用 Dockerfile 把 Go 二进制和运行依赖构建成镜像，推到 Registry：
+
+```text
+代码 + Dockerfile
+  -> CI 构建 order-api@sha256:abc（不可变镜像）
+  -> Registry
+  -> 提交 Deployment / Service YAML
+```
+
+随后 Kubernetes 与 etcd 的协作如下：
+
+```text
+1. kubectl apply YAML
+   -> API Server 认证、鉴权、准入校验
+   -> API Server 将 Deployment、Service、ConfigMap、Secret 的期望状态写入 etcd
+
+2. Deployment Controller 通过 API Server Watch 到 Deployment
+   -> 创建 ReplicaSet，再创建 3 个尚未绑定 Node 的 Pod
+   -> 这些对象的期望状态继续由 API Server 持久化到 etcd
+
+3. Scheduler 通过 API Server Watch 到 Pending Pod
+   -> 按 request、节点可用资源、污点容忍、亲和性筛选和打分
+   -> 选择 node-b，并通过 API Server 写入 Pod.spec.nodeName
+   -> API Server 再将这次绑定写入 etcd
+
+4. node-b 的 kubelet 通过 API Server Watch 到“分配给我”的 Pod
+   -> 通过 CRI 让 containerd 拉取 order-api@sha256:abc
+   -> 创建容器；CNI 配置 Pod 网络；若有 PVC 则 CSI 挂盘
+   -> 按 requests / limits 配置 cgroups，并持续上报 PodStatus 给 API Server
+
+5. readiness probe 通过
+   -> EndpointSlice / Service 相关控制器更新可用后端
+   -> CoreDNS / kube-proxy 等据此让流量进入这个就绪 Pod
+```
+
+这里三者的职责不能互换：**Docker 产出可运行、可复现的镜像；Kubernetes 把“3 个副本应该运行”的声明调度并收敛为现实；etcd 持久化并一致地保存这份声明和控制面状态。**etcd 不存镜像层、不直接创建容器，也不承担订单业务数据。
+
+### 同一个例子的两次追问
+
+**Pod 崩了怎么办？**kubelet 上报容器退出；控制器从 API Server 观察到实际副本不足，创建替代 Pod。整个过程依赖 etcd 中“期望 3 副本”的事实，而不是某台机器临时记忆“原来有 3 个”。
+
+**把镜像升级为 `sha256:def` 怎么办？**修改 Deployment 的 Pod template。API Server 写入 etcd；Deployment Controller Watch 到新版本后按滚动升级策略创建新 Pod、等待 readiness，再逐步缩掉旧 ReplicaSet。发生异常则暂停 / 回滚 template；不能仅在某台 Node 上手工 `docker pull`，否则控制面声明与真实状态会漂移。
+
+### etcd 不可用时会怎样？
+
+已经在节点上运行的容器通常不会因为 etcd 短暂不可用立刻停止；但 API Server 无法可靠读写控制面状态，创建 Pod、调度、扩缩容、发布、控制器收敛等会受影响。生产中 etcd 常部署奇数节点（通常 3 或 5）跨故障域，监控 leader 变化、磁盘延迟、请求延迟、DB 大小和告警；并定期做快照备份与恢复演练。
+
+---
+
+## 六、你现在会用 kubectl，但要知道它到底在做什么
 
 `kubectl` 本质上是一个客户端工具。  
 它通常不是直接去某个 Pod 上执行魔法，而是：
@@ -627,7 +710,7 @@ StorageClass = 货物类别 / 供货规则
 
 ---
 
-## 五、高频面试题：用基础知识组织成短答
+## 七、高频面试题：用基础知识组织成短答
 
 > 第二、三章负责把概念讲透；本章不再重复教材，而是给出面试时的回答顺序、易错点和进阶追问。复习时先读基础，再用这一章自测。
 
@@ -777,9 +860,45 @@ CSI 是容器存储接口，Driver 将 PVC 的请求落到具体云盘、NFS、C
 
 ---
 
-### C. AI / 云原生进阶
+### C. etcd 与一致性
 
-#### 16. GPU 在 Kubernetes 里怎么调度？和 CPU / 内存有什么区别？
+#### 16. etcd 是什么？它在 Kubernetes 中是不是服务注册中心？
+
+**答案：**
+
+etcd 是 Kubernetes 的强一致状态存储，保存 API 对象的持久化状态；它不是给业务服务直接查询实例地址的注册中心。业务服务发现通常通过 Service 与 CoreDNS，kube-proxy 或网络实现实际转发。正常情况下组件经 API Server 间接使用 etcd，不能绕过 API Server 直接改 etcd。
+
+#### 17. etcd 为什么偏 CP？Raft 写入如何成功？
+
+**答案：**
+
+网络分区时 etcd 宁可让少数派不能写，也不接受两边冲突的状态。Raft Leader 收到写请求后追加日志、复制给 Follower，获得多数派确认才提交并返回成功；3 节点需要 2 个确认。这就是它为控制面元数据选择一致性而牺牲少数派可写性的原因。
+
+#### 18. Watch 和 Lease 分别用来做什么？有什么坑？
+
+**答案：**
+
+Watch 推送 key / 前缀变更，适合控制器感知对象变化；Lease 给临时 key 附加 TTL，未 keepalive 时自动过期，适合存活检测或协调。Watch 消费端要保存 revision，遇到 compaction 或连接断开时重新 List + Watch；Lease 不是万能分布式锁，涉及外部副作用仍要配合版本校验 / fencing token。
+
+### D. Docker、Kubernetes、etcd 如何协作
+
+#### 19. 部署一个 Docker 镜像到 Kubernetes，etcd 在哪里参与？
+
+**答案：**
+
+Docker / CI 先构建并推送镜像；`kubectl apply` 将“运行几个副本、使用哪个镜像、资源多少”的声明提交 API Server，API Server 才把它持久化到 etcd。控制器、Scheduler、kubelet 通过 API Server Watch 和更新对象，最终由 kubelet 拉镜像、调用 runtime 创建容器。etcd 保存的是“应运行什么、已绑定哪台节点、当前状态”，不负责存镜像或直接启动容器。
+
+#### 20. etcd 短暂不可用，正在运行的服务会立刻全挂吗？
+
+**答案：**
+
+通常不会。已在节点上运行的容器可以继续执行；但控制面难以可靠读写状态，新的创建、调度、扩缩容、滚动发布和故障收敛会受影响。回答时再补充高可用做法：奇数节点组成多数派、跨故障域部署、低延迟磁盘、监控与定期快照恢复演练。
+
+---
+
+### E. AI / 云原生进阶
+
+#### 21. GPU 在 Kubernetes 里怎么调度？和 CPU / 内存有什么区别？
 
 **答案：**
 
@@ -801,7 +920,7 @@ GPU 驱动 + Device Plugin
 
 官方 GPU 调度依赖 Device Plugin，并要求节点安装厂商驱动和对应插件。[Kubernetes GPU 调度](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
 
-#### 17. 训练任务和在线推理任务在调度上有什么不同？
+#### 22. 训练任务和在线推理任务在调度上有什么不同？
 
 **答案：**
 
@@ -809,7 +928,7 @@ GPU 驱动 + Device Plugin
 
 在线推理更看首 token / P99、可用性和弹性：请求可能很短、负载波动大，常按 QPS、队列长度、GPU 利用率或 KV Cache 水位扩缩；需要模型副本、路由、batching 和限流。它可以容忍小粒度共享或动态批处理，但必须为突发流量预留余量。简记为：**训练追求成组拿齐资源和总吞吐；推理追求低延迟、弹性与稳定服务。**
 
-#### 18. GPU 很贵，怎样提高利用率？
+#### 23. GPU 很贵，怎样提高利用率？
 
 **答案：**
 
@@ -823,7 +942,7 @@ GPU 驱动 + Device Plugin
 
 注意：利用率不是越高越好。在线推理把 GPU 压到接近 100% 往往会使排队和 P99 恶化，需为 SLO 留出容量。
 
-#### 19. Serverless AI 为什么会冷启动？怎样优化？
+#### 24. Serverless AI 为什么会冷启动？怎样优化？
 
 **答案：**
 
@@ -831,7 +950,7 @@ GPU 驱动 + Device Plugin
 
 优化要分别处理每一段：镜像做多阶段构建、减小层并使用就近 registry / 节点缓存；预拉镜像、预热节点；权重放本地高速缓存或共享只读缓存；保留少量 warm pool；让模型进程常驻并按模型规格分池；请求侧做排队、并发控制与动态 batch。代价是更高的空闲成本，所以应按流量周期、模型大小和首请求 SLO 设预热容量，而非无限保活。
 
-#### 20. 镜像怎样构建、分发？几千台机器同时拉镜像怎么办？
+#### 25. 镜像怎样构建、分发？几千台机器同时拉镜像怎么办？
 
 **答案：**
 
@@ -839,7 +958,7 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 
 大规模发布不能让数千节点同一时刻直连一个 Registry：会造成 Registry、跨机房带宽和镜像源限流雪崩。可组合使用区域 Registry mirror / pull-through cache、P2P 分发或节点级缓存；先用 DaemonSet 在目标节点预拉热点镜像；分批发布并限制并发拉取；对大镜像使用层复用和懒加载。每层还要校验 digest，失败指数退避，Registry、节点磁盘和拉取时延必须有监控。镜像是包含应用及依赖的可执行软件包，通常先推送 Registry 再由 Pod 引用。[Kubernetes Images](https://kubernetes.io/docs/concepts/containers/images/)
 
-#### 21. 怎样做灰度发布和故障回滚？
+#### 26. 怎样做灰度发布和故障回滚？
 
 **答案：**
 
@@ -849,7 +968,7 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 
 ---
 
-## 六、最近公开面经里，大厂常问哪些 Docker / K8s 点？
+## 八、最近公开面经里，大厂常问哪些 Docker / K8s / etcd 点？
 
 根据近期公开可见的牛客内容，重复出现比较多的是：
 
@@ -869,7 +988,7 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 
 ---
 
-## 七、你明天要面云原生 / Infra 组，最该背的 12 个题
+## 九、你明天要面云原生 / Infra 组，最该背的 14 个题
 
 1. Docker 和虚拟机区别
 2. Docker 怎么实现隔离
@@ -883,12 +1002,14 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 10. liveness / readiness / startup probe 区别
 11. PV / PVC / StorageClass 关系
 12. OOMKilled / CrashLoopBackOff 怎么排查
+13. etcd 为什么偏 CP，Raft 写入怎样提交
+14. Docker、Kubernetes、etcd 怎样协作部署一个服务
 
-如果你把这 12 个讲清楚，已经能覆盖很多容器 / K8s 初中级面试。
+如果你把这 14 个讲清楚，已经能覆盖很多容器 / K8s / etcd 的初中级面试。
 
 ---
 
-## 八、来源（基础定义 + 近期公开面经）
+## 十、来源（基础定义 + 近期公开面经）
 
 ### 官方文档 / 一手资料
 
@@ -912,6 +1033,14 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
    https://kubernetes.io/docs/concepts/containers/cri/
 10. Kubernetes RuntimeClass  
     https://kubernetes.io/docs/concepts/containers/runtime-class/
+11. Kubernetes Cluster Architecture  
+    https://kubernetes.io/docs/concepts/architecture/
+12. Kubernetes API Server Bypass Risks（etcd 访问边界）  
+    https://kubernetes.io/docs/concepts/security/api-server-bypass-risks/
+13. etcd API Guarantees  
+    https://etcd.io/docs/v3.5/learning/api_guarantees/
+14. etcd Distributed Coordination  
+    https://etcd.io/docs/v3.6/learning/why/
 
 ### 公开面经 / 公开讨论（牛客为主）
 
@@ -939,7 +1068,7 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 
 ---
 
-## 九、最后给你的学习顺序建议（按新手版）
+## 十一、最后给你的学习顺序建议（按新手版）
 
 ### 第 1 步：先背清对象关系
 
@@ -976,4 +1105,4 @@ K8s: Deployment -> ReplicaSet -> Pod -> Service -> Ingress
 - Ingress Controller
 - etcd
 
-如果时间有限，先过第二章的“容器、镜像、隔离”，再过第三章的“Pod、Deployment、Service、Pod 创建链路、资源隔离”，最后用第五章 B 组的 4～15 题自测；面 AI / Infra 岗再补 C 组的 GPU、冷启动、镜像分发和发布回滚。
+如果时间有限，先过第二章的“容器、镜像、隔离”，再过第三章的“Pod、Deployment、Service、Pod 创建链路、资源隔离”，随后读第四、五章，确保能讲清 etcd 与控制面如何协作；最后用第七章 B～D 组自测。面 AI / Infra 岗再补 E 组的 GPU、冷启动、镜像分发和发布回滚。
