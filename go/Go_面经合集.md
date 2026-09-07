@@ -1888,10 +1888,10 @@ B 灰 → 黑
    ↓
 ④ Concurrent Mark
    - 扫描 Roots
-   - 扫描 goroutine 栈
-   - 扫描灰色堆对象
-   - 白 → 灰 → 黑
-   - 业务同时继续运行
+     - 全局变量
+     - goroutine 栈
+     - runtime roots
+   - 扫描由 Roots / 其他对象发现的灰色堆对象
    ↓
 ⑤ 短暂 STW：Mark Termination
    - 确认标记完成
