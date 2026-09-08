@@ -2436,40 +2436,35 @@ Redis 里 `ZSET` 的职责分成两部分：
 
 ### 45. 如何结合 Outbox 和 Inbox，解决 MySQL 与 MQ 的双写、重复投递问题？
 
-**用“订单支付后发积分”理解整条链路：**
+**用“订单支付后发积分”理解：**
 
 ```text
-订单服务本地事务
-  写 orders（状态 PAID）
-  + 写 outbox_events（evt-9001, order.paid）
-  -> 一起提交 MySQL
-  -> CDC 订阅 binlog，只把已提交的 outbox_events 发到 MQ
-  -> 积分服务消费 evt-9001
-  -> 本地事务：写 inbox_events 去重记录 + 写积分流水
-  -> 一起提交后才 ack MQ
+订单事务：orders = PAID + outbox_events(evt-9001) 一起提交
+  -> CDC 读 binlog（或 relay 轮询 Outbox）
+  -> MQ：order.paid(evt-9001)
+  -> 积分服务：事件去重 + 积分流水，同一事务提交
+  -> 最后 ack MQ
 ```
 
-先看为什么需要 Outbox：若订单服务先提交订单、再发 MQ，可能在两步之间宕机，造成“订单已支付、积分事件丢失”。改为在**同一个 MySQL 事务**中写订单和 `outbox_events`，那么订单成功时，待发送事件一定也已经落库；事务失败时两者一起回滚。
+**Outbox：**订单提交后再发 MQ，可能因进程崩溃、MQ 不可用或发送结果超时，留下“订单成功、事件丢失”。所以订单与待发送事件在同一个 MySQL 事务中写入；事务成功，事件一定有可靠落点。投递器恢复后会继续发，但也可能重发，因此按至少一次处理。
 
-CDC（Change Data Capture，变更数据捕获）持续读取 MySQL binlog，发现已提交的 Outbox 记录后投递 MQ。它可以替代定时轮询 Outbox 表，降低扫描压力、实时性更好；但发送后在提交 MQ 确认前崩溃仍可能重发，所以消息语义通常是**至少一次**。
+**CDC 要不要？**不一定。Outbox 是“事件可靠落库”的设计；CDC 是“从 MySQL binlog 把它搬到 MQ”的一种实现。小规模可用 relay 定时轮询 Outbox；已有 Canal / Debezium 时常用 CDC，实时性更好、少扫表。
 
-积分服务收到 `evt-9001` 后，在一个本地事务中先写 `inbox_events`，以 `(consumer_name, event_id)` 做唯一键；只有首次写入成功，才写积分流水。事务提交后再 ack MQ：
+**Inbox：**消费端必须保证同一个 `event_id` 重投时不重复加积分。最通用做法是单独的 `inbox_events` 表，以 `(consumer, event_id)` 建唯一键，并与积分流水同一事务提交；但不是必须单独建表。若积分流水本身有 `UNIQUE(source_event_id)`，直接用业务表即可。只靠业务代码“先查再写”不够，并发重投仍可能重复执行。
 
-- 业务已提交但 ack 丢失：MQ 重投，Inbox 唯一键冲突，直接跳过积分；
-- 消费到一半宕机：Inbox 和积分流水一起回滚，重投后可完整执行。
+#### 它和“binlog → CDC → Kafka → Redis / 本地缓存”有什么关系？
 
-#### Outbox、CDC、Inbox 分别做什么？
+两者可复用 CDC、Kafka，但目的不同：
 
-| 组件 | 所在位置 | 一句话职责 |
+| 链路 | CDC 订阅什么 | 目的 |
 | --- | --- | --- |
-| **Outbox** | 生产者 MySQL | 将“要发什么业务事件”与订单等业务数据原子落库，防止事件根本没留下。 |
-| **CDC** | MySQL binlog → MQ 的传输链路 | 捕获已提交的 Outbox 变化并投递；它是可靠搬运工，不保证只搬一次。 |
-| **Inbox** | 消费者 MySQL | 用稳定 `event_id` 去重，并与本地业务副作用同事务提交，防止重投重复生效。 |
+| Outbox + CDC | `outbox_events` | 投递 `order.paid` 这类**业务事件**给积分、物流等下游。 |
+| 缓存 CDC | `orders` 等业务表 | 删 / 更新 Redis、本地缓存，使缓存随数据库变更收敛。 |
 
-所以 **Outbox 是数据设计，CDC 是投递方式，Inbox 是消费幂等设计。**也可以不用 CDC、改由 relay 轮询 Outbox；但不能只做 CDC 而没有清晰的 Outbox 事件模型，否则容易把底层表字段变更直接泄露成业务事件，也无法自然表达 `event_id`、事件类型和 payload。
+Outbox 关注事件 ID、事件类型和业务语义；缓存 CDC 关注缓存 key、版本与删 / 更新策略。CDC 本身不负责幂等：积分消费者要靠 Inbox / 业务唯一键，缓存消费者也要处理重复和乱序。
 
 **面试回答：**
 
-> 创建订单时，我会把订单和 Outbox 事件放进同一个 MySQL 事务；CDC 从 binlog 读取已提交的 Outbox 并投递 MQ。由于 CDC / MQ 可能至少一次重投，下游用 Inbox 的 `(consumer, event_id)` 唯一键，并和积分流水同事务提交，成功后再 ack。Outbox 防丢事件，CDC 负责搬运，Inbox 防重复副作用；最终是至少一次投递下的幂等效果，而不是跨 MySQL 和 MQ 的 exactly-once。
+> Outbox 防“业务已提交但事件没留下”，CDC 或 relay 负责把已落库事件送到 MQ，Inbox / 业务唯一键防消息重投导致重复副作用。CDC 也可用于缓存同步，但缓存 CDC 关注数据变更，Outbox CDC 关注明确的业务事件；两者可复用基础设施，不能混淆职责。
 
 ---
