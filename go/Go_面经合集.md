@@ -294,6 +294,20 @@ for i := 0; i < 10001; i++ {
 
 - channel 底层是一个带锁的 `hchan` 结构，内部同时维护环形缓冲区、发送等待队列和接收等待队列，发送和接收本质上就是在这三者之间做匹配。
 
+#### channel 在 goroutine 中到底起什么作用？
+
+channel 不只是“一个线程安全队列”，更接近 Go CSP 模型里的**通信与同步边界**：goroutine 不直接抢同一份可变状态，而是通过消息交接工作和所有权。
+
+| 作用 | 常见写法 | 它解决什么 |
+| --- | --- | --- |
+| 传递任务 / 结果 | `jobs <- job`、`result := <-results` | 生产者与消费者解耦，减少共享内存 |
+| 同步与阶段屏障 | `done <- struct{}{}`、`for r := range results` | 等待所有并发任务完成再进入下一阶段 |
+| 背压 / 并发上限 | `make(chan Job, 100)` 或 semaphore channel | 队列满时生产者阻塞或拒绝，避免无限创建 goroutine |
+| 取消与退出通知 | 配合 `ctx.Done()`、关闭 `done` channel | 让多个 worker 有一致退出信号 |
+| fan-out / fan-in | 多 worker 消费一个 jobs，协调者汇总 results | 有界并发地并行执行、统一收集 |
+
+channel 的安全边界也不能说过头：发送和接收本身并发安全，但如果发送的是 `*Order`、`map`、`slice`，发送后两边仍同时修改同一底层对象，照样会 data race。要么明确“发送后所有权转移、发送者不再修改”，要么对共享对象加锁。`close` 也只应由**唯一发送方 / 协调者**执行；接收方关闭或多个发送方争抢关闭都会导致 panic 或难以维护的协议。
+
 **内部结构：**
 
 ```go
@@ -848,6 +862,77 @@ func (l *SafeList) Append(x int) {
 - 监控队列积压、任务耗时、失败率
 - 根据这些指标增减 worker 数量
 - 但要有上限，避免无限扩容把系统反而压垮
+
+#### 实战追问：一批任务要并发执行、收集全部结果，全部结束后才能跑下一步，怎么做？
+
+这不是“每个任务 `go func()` 一下”就结束了。应把它设计成一个**有界的 fan-out / fan-in 阶段**：协调者投递任务，固定数量 worker 并发执行，结果汇总器等结果 channel 关闭；`range results` 结束本身就是“本阶段已收敛”的信号，之后才进入下一阶段。
+
+```text
+阶段 1：jobs ──► worker-1 ─┐
+                worker-2 ─┼──► results ──► coordinator 收集完毕
+                worker-N ─┘                         │
+                                                     ▼
+阶段 2：只在阶段 1 成功 / 按策略收集完成后开始
+```
+
+```go
+type Result struct {
+    ID  string
+    Val any
+    Err error
+}
+
+// jobs 只能由投递方关闭；results 只能由协调者在所有 worker 退出后关闭。
+func runPhase(ctx context.Context, jobs []Job, workers int) ([]Result, error) {
+    ctx, cancel := context.WithCancel(ctx)
+    defer cancel()
+
+    jobCh := make(chan Job)
+    resultCh := make(chan Result, len(jobs)) // 也可由协调者持续消费而不缓冲全部
+    var wg sync.WaitGroup
+
+    for i := 0; i < workers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for {
+                select {
+                case <-ctx.Done():
+                    return
+                case job, ok := <-jobCh:
+                    if !ok { return }
+                    val, err := handle(ctx, job)
+                    select {
+                    case resultCh <- Result{ID: job.ID, Val: val, Err: err}:
+                    case <-ctx.Done():
+                        return
+                    }
+                }
+            }
+        }()
+    }
+    go func() { // 唯一任务生产者
+        defer close(jobCh)
+        for _, job := range jobs {
+            select { case jobCh <- job: case <-ctx.Done(): return }
+        }
+    }()
+    go func() { wg.Wait(); close(resultCh) }() // 唯一 results 关闭者
+
+    var all []Result
+    var firstErr error
+    for r := range resultCh { // 直到所有 worker 退出，阶段 1 才真正完成
+        all = append(all, r)
+        if r.Err != nil && firstErr == nil {
+            firstErr = r.Err
+            cancel() // fail-fast：通知尚未开始 / 可取消的任务停下
+        }
+    }
+    return all, firstErr // 调用方校验后，再开始阶段 2
+}
+```
+
+上例采用 **fail-fast**：首个不可恢复错误触发 `cancel()`，快速停止尚未开始的任务；**best-effort** 则删除这段 `cancel()`，继续收集全部错误，适合批处理。无论哪种，worker 内的网络、DB、RPC 操作都必须接收同一个 `ctx`，否则调用 `cancel` 也停不掉正在阻塞的任务。再给任务加 deadline、幂等键、重试上限和队列上限，才是可上线的调度器；分布式场景还要把“任务领取”落到 MQ / DB 租约中，不能只靠单机 channel。
 
 **面试里推荐这样答：**
 

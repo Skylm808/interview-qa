@@ -203,6 +203,76 @@ CMD ["nginx", "-g", "daemon off;"]
 - `CMD`：容器启动时默认执行命令
 - `ENTRYPOINT`：容器主入口
 
+#### Dockerfile 常用命令：按“构建、文件、运行、治理”记
+
+| 指令 | 发生在何时 | 用途与易错点 |
+| --- | --- | --- |
+| `FROM image[:tag|@digest] [AS stage]` | 构建起点 | 选基础镜像；多阶段构建每个 `FROM` 开一个新 stage。生产应尽量锁定 digest 或受控版本，不能只漂浮在 `latest`。 |
+| `ARG` | 构建期 | 传构建参数；不会像 `ENV` 一样默认留给运行容器，但也**不适合放密钥**，可能出现在构建历史/缓存中。 |
+| `ENV` | 构建后仍生效 | 设置运行时环境变量；配置可以用，密码/token 不可写死。 |
+| `WORKDIR` | 后续指令 | 设置后续 `RUN`、`COPY`、`CMD` 的工作目录，比反复 `cd` 清晰可靠。 |
+| `COPY` | 构建期 | 把 build context 的文件复制进镜像；日常优先用它。配合 `.dockerignore` 缩小上下文。 |
+| `ADD` | 构建期 | 额外支持解压本地 tar、拉远程 URL 等；语义较隐式，普通复制优先 `COPY`。 |
+| `RUN` | 构建期 | 在构建容器内执行安装、编译、测试；结果进入镜像层，不是容器每次启动都执行。 |
+| `USER` | 运行期默认身份 | 切到非 root 用户；不要把“镜像能跑”建立在 root 权限上。 |
+| `EXPOSE` | 元数据 | 声明应用预期监听端口，**不会**自动发布宿主机端口；发布仍需 `-p` 或 K8s Service。 |
+| `VOLUME` | 运行期挂载点声明 | 指明适合外置持久化的路径；生产数据仍要由 volume/PVC 生命周期管理。 |
+| `ENTRYPOINT` | 启动时 | 固定主可执行文件，通常用 exec JSON 形式以正确接收信号。 |
+| `CMD` | 启动时 | 默认命令或 `ENTRYPOINT` 的默认参数；运行 `docker run image other` 可覆盖。 |
+| `HEALTHCHECK` | 运行期 | Docker 层健康检查；在 K8s 中通常更应配置 readiness/liveness/startup probes。 |
+| `LABEL` / `STOPSIGNAL` | 元数据 / 退出 | 放镜像来源、版本等元数据；指定优雅退出信号。 |
+
+`ENTRYPOINT ["/app/server"]` + `CMD ["--port=8080"]` 的组合很常用：默认执行 `/app/server --port=8080`，运行时传额外参数可以替换 CMD 而不必改变主程序。尽量使用 exec 形式（JSON 数组），避免 shell 作为 PID 1 吞掉 `SIGTERM`，导致容器或 Pod 不能优雅退出。
+
+#### `docker build` 时，镜像一层层到底是什么关系？
+
+镜像可理解为**按顺序叠加的只读差异层（diff layers）+ 配置/清单**。基础镜像已经有父层；后续会按 Dockerfile 顺序执行，每个会改变文件系统的 `RUN`、`COPY`、`ADD` 等操作产生一个新 diff layer，最终由 manifest 按父子顺序引用它们。运行容器时，运行时把这些只读层用 union filesystem 合并成一个视图，并在最上面加一个容器专属可写层。
+
+```text
+基础层：        OS / runtime
+第 1 层：       COPY go.mod go.sum
+第 2 层：       RUN go mod download
+第 3 层：       COPY 源码
+第 4 层：       RUN go build
+---------------------------------  镜像：只读层栈 + config
+容器运行时：    最上方增加 writable container layer
+```
+
+- 层按 content digest 去重：多个镜像可共享相同基础层，Registry 与节点缓存也可复用它们。
+- 缓存依赖父层：某层的 Dockerfile 指令、输入文件或父层变了，该层和其后所有层都需重建。因此依赖清单应先复制并安装依赖，业务源码后复制，避免改一行代码就重复下载依赖。
+- **删除不等于缩小历史层。**若先 `RUN apt install ...`，下一层才 `RUN rm ...`，大文件仍在前一层中；应在同一层清理，或更好地用多阶段构建让构建层不进入最终镜像。
+- `CMD`、`ENV`、`EXPOSE` 等主要改镜像 config / history，不一定增加文件系统 diff；面试中说“每行都等于一个很大的文件层”不够严谨。
+
+#### 编写镜像时注意什么？怎样真正把体积做小？
+
+目标不只是“小”：还要可复现、可缓存、可观测、最小权限和可修复。下面是一个 Go 服务的典型双阶段结构：构建工具、源码和缓存留在 build stage；最终 stage 只带可运行产物。
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+# scratch 仅适合静态二进制；若需要 CA 证书、时区或 shell，选受控的极小 runtime base
+FROM scratch
+COPY --from=build /out/server /server
+USER 65532:65532
+ENTRYPOINT ["/server"]
+```
+
+| 做法 | 为什么有效 | 代价 / 注意 |
+| --- | --- | --- |
+| 多阶段构建，最终只 `COPY --from=build` 产物 | 编译器、包管理器、源码、测试缓存不进最终镜像 | 不能因为多阶段而跳过测试、SBOM 和漏洞扫描 |
+| 合理基础镜像 / distroless / scratch | 少包、少攻击面、少下载量 | `scratch` 没 CA、时区、shell、动态库；应用需静态构建并接受调试方式变化 |
+| `.dockerignore` 排除 `.git`、测试产物、node_modules、密钥、本地缓存 | 减小 build context，也避免误把敏感文件复制进镜像 | 忽略规则要审查，别把运行必需文件排掉 |
+| 先复制 lockfile，再安装依赖，源码后复制 | 提高依赖层缓存命中，缩短构建 | lockfile 必须可靠，依赖需定期更新 |
+| 同一 `RUN` 中安装并清理包管理器缓存 | 不把下载缓存留在某个历史层 | 不要把大量无关命令硬拼成难维护的一行；多阶段通常更干净 |
+| 非 root、只读根文件系统、构建时 secret mount | 降低权限与密钥泄露风险 | 密钥不能用 `ARG` / `ENV` / `COPY` 写进层；运行配置交给 Secret/环境注入 |
+| 固定版本/digest、生成 SBOM、扫描与签名 | 可复现、可追溯、可修复供应链风险 | 不能只扫描一次，基础镜像更新也要重建 |
+
 ---
 
 ### 6. Volume（卷）为什么重要？
@@ -299,6 +369,8 @@ Docker 解决的是：
 
 > **Docker 更像“怎么造并运行一个容器”，K8s 更像“怎么大规模管理很多容器”。**
 
+补一个容易被追问的边界：Docker 既可指开发者常用的 CLI / build 工具，也可指 Docker Engine 运行时；Kubernetes 关注的是 OCI 容器镜像和 CRI 兼容 runtime（常见 containerd、CRI-O），并不要求每个节点都运行 Docker Engine。Kubernetes 从 v1.24 起不再内置 dockershim；但用 Docker/BuildKit 构建并推送 OCI 镜像，再由 K8s 节点拉取运行，仍是常见工作流。
+
 ---
 
 ## 三、Kubernetes 基础：你先把这些对象搞懂
@@ -352,6 +424,20 @@ K8s 主要解决：
 Pod 是 K8s 里的**最小调度单元**。
 
 它不是“某个容器”，而是“**一组共享网络和存储的容器**”。
+
+#### 一个 Pod 有哪些组件？先区分“YAML 里声明的”和“运行时提供的”
+
+| 组成 | 是否通常写在 Pod spec | 作用 |
+| --- | --- | --- |
+| `containers`（应用容器） | 是 | 真正提供业务的一个或多个容器；每个容器各自有 image、command、resources、probes、env、volumeMounts。 |
+| `initContainers` | 可选 | 在 app container 之前**按顺序**运行并成功结束，适合初始化目录、等待依赖、下载一次性配置。 |
+| sidecar | 可选 | 与主应用长期并行运行，如代理、日志采集、配置同步；它是容器角色，不是一个独立 K8s 顶级对象。 |
+| ephemeral container | 仅排障时动态添加 | 临时调试已运行 Pod，不是业务容器，不保证资源也不会自动重启。 |
+| `volumes` + `volumeMounts` | 可选 | Pod 级共享存储，如 `emptyDir`、ConfigMap、Secret、PVC；多个容器可挂载同一卷。 |
+| Pod 网络 / sandbox（常被称 pause） | 运行时创建 | 让同一个 Pod 的容器共享 Pod IP、端口空间和网络命名空间；不是业务 YAML 中要手写的一个普通容器。 |
+| Pod 级配置 | 是 | metadata/labels、serviceAccount、securityContext、DNS、restartPolicy、调度约束等，定义身份、安全和运行边界。 |
+
+Service、Ingress、Deployment、ConfigMap/PVC 都会被 Pod 引用或管理，但**不属于 Pod 内部组件**。最常见形态仍是“一个 app container + 可选 init container / sidecar + volume + Pod 网络”；不要为了凑多容器把无关服务塞进一个 Pod，独立伸缩、独立故障域的服务应拆为不同 Pod。
 
 通常你会遇到两种情况：
 
