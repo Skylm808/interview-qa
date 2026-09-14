@@ -11,8 +11,8 @@
 ```text
 Docker：应用 + Dockerfile -> Image -> Registry -> Container -> Volume
 K8s：Node / Control Plane -> Pod -> Deployment -> Service / Ingress
-                                 -> ConfigMap / Secret / PV / PVC
-                                 -> Scheduler / kubelet / CNI / CSI
+                                 -> ConfigMap / Secret / PersistentVolume(PV) / PersistentVolumeClaim(PVC)
+                                 -> Scheduler / kubelet / CNI（容器网络接口）/ CSI（容器存储接口）
 etcd：Kubernetes API 对象的强一致持久化状态存储
 ```
 
@@ -21,6 +21,106 @@ etcd：Kubernetes API 对象的强一致持久化状态存储
 - **etcd** 保存 Kubernetes 控制面认定的集群状态，使多个控制面组件基于同一份事实做收敛。
 
 因此不要先背 K8s 名词：先弄清镜像和容器，再理解 Pod 为什么是调度单位，然后理解 etcd 为什么保存“期望状态”，最后再看控制器怎样收敛它。
+
+### 先查这张表：全文缩写、中文名与所属层
+
+第一次看到缩写时，先不要急着背。先问三个问题：**它在哪一层、谁调用它、它解决什么问题**。下表覆盖本文会反复出现的名词；正文第一次出现时也会尽量写出全称。
+
+| 缩写 / 术语 | 英文全称 | 中文解释 | 所属层 / 谁使用 |
+| --- | --- | --- | --- |
+| K8s | Kubernetes（8 表示 k 与 s 中间的 8 个字母） | **容器编排系统**：调度、伸缩、发布、自愈、网络与存储编排。 | 集群编排层 |
+| Docker | Docker（产品名） | 用于构建、分发、运行容器的工具与运行环境。 | 构建与单机容器层 |
+| AI | Artificial Intelligence | **人工智能**；本文的 AI / 云原生部分指承载训练、推理等工作负载的容器平台问题。 | 业务工作负载层 |
+| OCI | Open Container Initiative | 开放容器规范；镜像格式和运行时行为的共同标准。Docker/BuildKit 构建出的镜像通常兼容它。 | 容器规范层 |
+| CLI | Command-Line Interface | 命令行客户端，例如 `docker`、`kubectl`。它发请求，不等于后端实际执行者。 | 人与系统的入口层 |
+| API | Application Programming Interface | 程序之间约定的调用接口；K8s 中通常特指 API Server 暴露的资源接口。 | 控制面入口 |
+| YAML | YAML Ain't Markup Language | 人类可读的配置文件格式；用来声明 Deployment、Service、Pod 等“期望状态”。 | 声明配置层 |
+| Pod | Pod（K8s 对象名） | K8s 最小调度单位，一组共享网络与可共享存储的容器。 | 工作负载层 |
+| CRI | Container Runtime Interface | **容器运行时接口**；kubelet 通过它调用 containerd、CRI-O 等运行时创建 Pod sandbox 和容器。 | 节点运行时接口 |
+| CNI | Container Network Interface | **容器网络接口**；运行时调用网络插件，为 Pod 配置网卡、IP、路由和网络策略。 | 节点网络层 |
+| CSI | Container Storage Interface | **容器存储接口**；存储插件通过它把云盘、NFS、Ceph 等卷挂到节点和 Pod。 | 节点存储层 |
+| PV | PersistentVolume | **持久卷**：集群可提供的一块实际持久化存储资源。 | K8s 存储对象 |
+| PVC | PersistentVolumeClaim | **持久卷声明 / 申请单**：工作负载申请存储的对象，Pod 通常引用它而不是直接操作 PV。 | K8s 存储对象 |
+| DNS | Domain Name System | **域名系统**；K8s 常由 CoreDNS 提供 Service 名到地址的解析。 | 服务发现层 |
+| IP | Internet Protocol | 网络地址协议；同一 Pod 中的容器共享一个 Pod IP。 | 网络基础层 |
+| RBAC | Role-Based Access Control | **基于角色的访问控制**；用 Role/ClusterRole 与 Binding 决定谁能读写哪些 K8s API 对象。 | 控制面安全层 |
+| CPU | Central Processing Unit | 处理器资源；K8s 用 `m` 表示毫核，例如 `500m` 是半个核。 | 节点资源层 |
+| GPU | Graphics Processing Unit | 图形 / 通用并行计算设备；在 K8s 中常以扩展资源申请。 | 节点异构资源层 |
+| OOM | Out Of Memory | **内存耗尽**；进程超过可用内存或容器内存上限时，可能被内核杀死。 | Linux / 容器运行层 |
+| VM | Virtual Machine | **虚拟机**；虚拟硬件并运行自己的 Guest OS，隔离通常比共享内核容器更强。 | 虚拟化层 |
+| OS | Operating System | **操作系统**；容器共享宿主机 Linux 内核，镜像提供的是用户态文件与依赖，不是完整 Guest OS。 | 操作系统层 |
+| cgroup | control group | Linux 的资源控制机制，限制 / 统计进程组的 CPU、内存、IO 等资源。 | Linux 内核资源层 |
+| namespace | Linux namespace | Linux 的视图隔离机制，例如 PID、Network、Mount、IPC、UTS namespace。 | Linux 内核隔离层 |
+| PID | Process ID | 进程编号；PID namespace 让容器看到独立的进程号空间。 | Linux 隔离层 |
+| IPC | Inter-Process Communication | **进程间通信**；IPC namespace 隔离共享内存、信号量、消息队列等。 | Linux 隔离层 |
+| NET / MNT / UTS | Network / Mount / Unix Time-sharing System namespace | 分别是网络、挂载点、主机名 / 域名视图隔离；都是 Linux namespace 的具体类型。 | Linux 隔离层 |
+| IO | Input / Output | 输入输出资源，常在 cgroups 与存储性能语境中指磁盘 / 网络等 I/O。 | Linux 资源层 |
+| NFS | Network File System | 网络文件系统，可作为 CSI Driver 对接的一类后端存储。 | 存储后端 |
+| SSD / HDD | Solid State Drive / Hard Disk Drive | 固态硬盘 / 机械硬盘；StorageClass 可按这类后端性能特征区分。 | 存储硬件层 |
+| LB | Load Balancer | **负载均衡器**；将流量分发到多个后端。K8s `LoadBalancer` Service 常请求云厂商 LB。 | 流量入口层 |
+| CNAME | Canonical Name | DNS 别名记录；`ExternalName` Service 通常让集群 DNS 返回一个 CNAME，而不是创建 Pod 转发规则。 | DNS 层 |
+| HTTP / HTTPS | Hypertext Transfer Protocol / HTTP Secure | Web 应用协议；HTTPS 是 HTTP 加 TLS 加密保护。Ingress 通常处理这类七层流量。 | 应用网络层 |
+| TLS | Transport Layer Security | **传输层安全协议**；为 HTTPS 等连接提供加密、身份认证和完整性保护。 | 传输安全层 |
+| TCP / UDP | Transmission Control Protocol / User Datagram Protocol | 传输层的可靠字节流协议 / 无连接数据报协议；Ingress 主要处理 HTTP(S)，TCP / UDP 需看网关或 Controller 的额外能力。 | 传输层 |
+| SSH | Secure Shell | 远程安全登录协议；“SSH 到节点手改容器”会绕开 K8s 的声明式管理。 | 运维访问层 |
+| CA | Certificate Authority | **证书颁发机构**；`scratch` 等极简镜像若没有 CA 根证书，程序可能无法校验 HTTPS 服务端证书。 | PKI / TLS 安全层 |
+| PKI | Public Key Infrastructure | **公钥基础设施**；包含证书、私钥、CA 与信任链等体系。 | 安全基础设施 |
+| CI | Continuous Integration | **持续集成**；代码提交后自动构建、测试、扫描并产出镜像的流水线。 | 交付流程层 |
+| CD | Continuous Delivery / Deployment | **持续交付 / 持续部署**；把通过验证的版本逐步发布到环境。 | 交付流程层 |
+| QPS | Queries Per Second | 每秒请求数，常作为服务负载或扩缩容参考指标。 | 性能指标 |
+| P99 | 99th Percentile | 99% 请求不超过的延迟；用于观察长尾体验。 | 性能指标 |
+| SLO | Service Level Objective | 服务等级目标，例如 P99 小于 200ms、可用性 99.9%。 | 可靠性目标 |
+| SIGTERM | Signal Terminate | Linux 的“请求进程优雅退出”信号；Pod 终止时通常先发它。 | Linux 进程生命周期 |
+| DDL | Data Definition Language | 数据库定义语言，例如建表、加列；发布时要考虑与新旧应用版本兼容。 | 数据库变更 |
+| SBOM | Software Bill of Materials | **软件物料清单**；记录镜像中包含哪些组件和版本，便于漏洞追踪。 | 软件供应链安全 |
+| P2P | Peer-to-Peer | **点对点**分发；大规模拉取镜像时可让节点间协作分发，降低 Registry 压力。 | 镜像分发层 |
+| JSON | JavaScript Object Notation | 常用结构化数据格式；Kubernetes API 在传输 / 存储语义上处理结构化对象，YAML 常只是人写配置时的表现形式。 | 数据序列化层 |
+| URL | Uniform Resource Locator | 网络资源地址，例如 Registry、Webhook 或 API 地址。 | Web 基础 |
+| MQ | Message Queue | **消息队列**；可靠异步消息系统。etcd Watch 是状态变更通知，不提供 MQ 那种消费确认、积压与重投语义。 | 消息中间件层 |
+| DB | Database | **数据库**；etcd 是面向控制面元数据的强一致 KV 存储，不替代业务关系型数据库。 | 数据存储层 |
+| ID | Identifier | 标识符；例如容器 ID、节点 ID、资源 ID，用于唯一定位对象。 | 通用术语 |
+| CUDA | Compute Unified Device Architecture | NVIDIA 的 GPU 计算平台与编程环境。 | GPU 软件栈 |
+| MIG | Multi-Instance GPU | NVIDIA 将一张支持 MIG 的 GPU 切成多个硬件隔离实例的能力。 | GPU 切分 |
+| MPS | Multi-Process Service | NVIDIA 让多个进程更好共享 GPU 执行资源的机制；不是 K8s 原生资源模型。 | GPU 共享 |
+| RDMA | Remote Direct Memory Access | **远程直接内存访问**；高性能网络能力，多机训练会关心其拓扑与延迟。 | 高性能网络 |
+| CAP | Consistency, Availability, Partition tolerance | 分布式系统面对网络分区时，一致性与可用性的取舍框架。 | 分布式系统理论 |
+| KV | Key-Value | 键值数据模型；etcd 是强一致 KV 存储。 | etcd 数据模型 |
+| TTL | Time To Live | 生存时间 / 过期时间；etcd Lease 到期可自动删除绑定的 key。 | 存储协调机制 |
+
+> Dockerfile 指令（`FROM`、`RUN`、`COPY`、`CMD`、`ENTRYPOINT` 等）是构建脚本关键字，不是系统组件；其含义见第二章 Dockerfile 小节。遇到 `CNI / CSI / CRI` 时记住：**CRI 起容器，CNI 配网络，CSI 挂存储。**
+
+### 再查这张表：不是缩写、但最容易把层次搞乱的 K8s 名词
+
+| 名词 | 中文 / 直白解释 | 所属层与关系 |
+| --- | --- | --- |
+| Control Plane（控制面） | 管理集群、保存期望状态、安排工作；通常包含 API Server、Scheduler、Controller Manager、etcd。 | “大脑”，做全局决策，不在业务 Node 上亲自运行你的应用容器。 |
+| Node（节点） | 集群中的一台工作机器，可能是物理机或 VM。 | “手脚”，kubelet 在此调用 runtime 真正运行 Pod。 |
+| Controller（控制器） | 不断观察对象，把实际状态拉回期望状态的循环程序。 | 例如 Deployment Controller 发现少一个副本，会创建 Pod 对象。 |
+| Reconciliation Loop（调谐 / 收敛循环） | `观察当前状态 → 与期望比较 → 执行动作 → 再观察`。 | 是 K8s 自愈、扩缩容、滚动更新的共同工作方式。 |
+| Label / Selector（标签 / 选择器） | 给对象贴键值标签；Selector 用条件选中一组对象。 | Deployment、Service 常靠它找到应管理或转发给哪些 Pod。 |
+| EndpointSlice（端点切片） | 记录某个 Service 当前有哪些可用后端地址的 API 对象。 | Service 的“后端名单”；readiness 失败的 Pod 通常不应在可用名单中。 |
+| Pod sandbox（Pod 沙盒） | runtime 为一个 Pod 创建的共享运行边界，承载共享网络等基础设施。 | 先有 sandbox / 网络，再在其中运行该 Pod 的一个或多个容器。 |
+| Container runtime（容器运行时） | 真正创建、停止、管理容器的节点软件，如 containerd、CRI-O。 | kubelet 经 CRI 调用它；Docker Engine 不是所有 K8s 节点都必须安装。 |
+| Ingress Controller（Ingress 控制器） | 实际 watch Ingress 规则并承接 HTTP(S) 请求的代理 / Controller。 | Ingress 只是规则对象；Controller 才是实际处理流量的程序。 |
+| CoreDNS | Kubernetes 集群常用的 DNS 服务实现。 | 让应用用 `service.namespace.svc` 这样的稳定域名找到 Service。 |
+
+### 术语补充：流程图里剩下的“黑话”也先翻译
+
+| 术语 | 中文解释 | 在本文中出现时到底表示什么 |
+| --- | --- | --- |
+| Registry（镜像仓库） | 存放、分发容器镜像的服务，例如 Docker Hub、Harbor 或云厂商镜像仓库。 | CI 把镜像推入 Registry；Node 上的 runtime 再从中拉取。 |
+| image digest（镜像摘要） | 镜像内容的哈希标识，例如 `sha256:...`，内容不变则摘要不变。 | 比可变的 `latest` / `v1` tag 更适合锁定生产实际运行的版本。 |
+| Admission / Webhook（准入 / 准入回调） | API Server 持久化对象前的检查或修改阶段；Webhook 是可插入的外部回调。 | 可做默认值、策略校验、注入 sidecar；它不是业务请求的普通 HTTP 网关。 |
+| Bind（绑定） | Scheduler 把一个尚未调度的 Pod 指向某个 Node 的动作。 | 结果表现为 Pod 的 `spec.nodeName` 被写入；并不是创建容器。 |
+| resourceVersion / revision（资源版本 / 修订号） | 对象或 etcd 状态的单调版本标记。 | List + Watch 依赖它避免漏看变更；历史被压缩后可能需要重新 List。 |
+| init container（初始化容器） | 在业务容器前按顺序执行、成功后退出的一次性容器。 | 适合初始化目录、迁移、等待前置条件；未成功时业务容器不会启动。 |
+| sidecar（边车容器） | 与业务容器在同一 Pod 长期并行的辅助容器。 | 常做日志采集、代理、配置同步；是容器角色，不是单独的 K8s 顶级对象。 |
+| veth（virtual Ethernet pair） | 虚拟网卡对，一端在 Pod 网络命名空间，一端连到宿主机 / 网络插件。 | 是 CNI 为 Pod 组网时常见的 Linux 实现细节，不是 K8s API 对象。 |
+| imagePullSecrets（拉取镜像凭据） | 让 kubelet / runtime 访问私有 Registry 的认证信息引用。 | 镜像拉取失败时需核对镜像地址、该 Secret、ServiceAccount 与网络。 |
+| throttling（限流 / 限速） | 超过 CPU limit 后，cgroups 限制进程可获得 CPU 时间的现象。 | 常表现为延迟升高，不等于进程被杀；内存超限才更接近 OOM Kill。 |
+| quorum（法定多数） | Raft 中可提交日志、可选出 Leader 的多数成员集合。 | 3 节点 quorum 是 2；失去 quorum 时 etcd 为保持一致性拒绝继续写。 |
+| compaction / defragmentation | 历史版本压缩 / 数据文件碎片整理。 | 前者会让太旧的 Watch revision 失效；后者才可能回收已释放的磁盘空间。 |
+| fencing token（栅栏令牌） | 单调递增的操作编号，资源端只接受更新的编号。 | 用于阻止旧锁持有者超时后“复活”再写入外部系统。 |
 
 ---
 
@@ -396,6 +496,25 @@ K8s 主要解决：
 - 配置怎么分发
 - 存储怎么挂载
 
+更本质地说，K8s 是一个**声明式的、持续收敛的控制系统**。你提交的不是“去 node-3 执行一条 `docker run` 命令”，而是“我希望一直有 3 个 `order-api` 副本，且它们满足这些资源、网络和配置条件”。之后控制器不断比较“期望”与“现实”，发现少一个就补一个，发现版本不同就逐步替换。
+
+```text
+你提交 YAML（期望状态）
+        |
+        v
+API Server ----> etcd：保存对象与版本
+        ^                    |
+        |                    v
+   状态回写 <---- Controller / Scheduler / kubelet 反复 List + Watch
+                         |
+                         v
+                    真实节点、容器、网络、存储（实际状态）
+
+核心动作：观察差异 -> 采取动作 -> 再观察，直到两者尽量一致
+```
+
+这也解释了一个面试常见误区：**K8s 不保证“某个原来的 Pod 永远不消失”，它保证“声明的副本和约束尽量被满足”。**Pod 所在节点故障时，控制器会创建替代 Pod；新 Pod 的 IP、名字甚至节点都可能改变，因此访问它必须依赖 Service，而不是写死 Pod IP。
+
 ---
 
 ### 2. K8s 集群最核心的角色
@@ -416,6 +535,37 @@ K8s 主要解决：
 一句话：
 
 > `apiserver` 是门口，`etcd` 是账本，`scheduler` 负责分配宿舍，`controller-manager` 负责查寝，`kubelet` 负责落实，`kube-proxy` 负责网络转发。
+
+把控制面与节点侧画在一起，会更容易记住谁“做决定”、谁“动手执行”：
+
+```text
+                    ┌──────────── 控制面（全局决策）─────────────┐
+kubectl / CI  ────> │ API Server <──> etcd                       │
+                    │     ^          保存期望状态 / 状态记录      │
+                    │     |                                      │
+                    │ Controller Manager：补副本、滚动更新等      │
+                    │ Scheduler：为未绑定的 Pod 选择 Node        │
+                    └─────|──────────────────────────────────────┘
+                          API Watch / 写状态
+                            |
+          ┌─────────────────┴─────────────────┐
+          v                                   v
+ ┌──────────── Node A ────────────┐  ┌──────────── Node B ────────────┐
+ │ kubelet：接收分配，落实 Pod     │  │ kubelet：接收分配，落实 Pod     │
+ │ CRI runtime：真正创建容器       │  │ CRI runtime：真正创建容器       │
+ │ CNI：Pod 网络；CSI：挂卷        │  │ CNI：Pod 网络；CSI：挂卷        │
+ │ kube-proxy：Service 转发规则    │  │ kube-proxy：Service 转发规则    │
+ └────────────────────────────────┘  └────────────────────────────────┘
+```
+
+| 组件 | 它真正做的事 | 初学者最容易说错的点 |
+| --- | --- | --- |
+| `kube-apiserver` | 认证、鉴权、准入、校验 API 对象；是控制面读写的统一入口。 | 不是“只给 kubectl 用的 Web 服务”；Controller、Scheduler、kubelet 也通过它协作。 |
+| `etcd` | 持久、强一致地保存 Kubernetes API 对象。 | 不直接拉镜像、不做服务转发，也不应该被业务代码直接读写。 |
+| `kube-controller-manager` | 运行多类控制器，例如 Deployment / ReplicaSet 控制器，持续补齐期望副本。 | 它创建或更新 **API 对象**，不在 Node 上直接启动进程。 |
+| `kube-scheduler` | 给尚未绑定节点的 Pod 做过滤、打分和绑定。 | 它只决定“去哪里”，不负责“在该节点怎样起容器”。 |
+| `kubelet` | 每个 Node 上的代理，观察分配给本机的 Pod，调用 CRI 落实并汇报状态。 | 它不是全局调度器；它只管理本机。 |
+| `kube-proxy` | 维护 Service 到后端 Pod 的转发规则（具体实现随模式而变）。 | Service 不是一个常驻代理进程；它是 API 对象，转发由节点网络实现。 |
 
 ---
 
@@ -528,6 +678,20 @@ Deployment -> ReplicaSet -> Pod
 
 你一般不会手动管 ReplicaSet，主要管 Deployment。
 
+再向下展开一次：
+
+```text
+Deployment（我要 3 个 v2 副本，按滚动方式更新）
+      |
+      v
+ReplicaSet（维持“这个版本”应该有 3 个 Pod）
+      |
+      v
+Pod（真正被调度到 Node 的运行单元）
+```
+
+当你把镜像从 `v1` 改为 `v2`，Deployment 通常不会把所有旧 Pod 一把删掉。它会新建一个代表 `v2` 的 ReplicaSet，逐步扩出就绪的新 Pod，同时逐步缩小 `v1` ReplicaSet，直到达到发布策略所允许的数量。这就是滚动更新。回滚本质上是把 Deployment 的 Pod 模板恢复到上一版本，而不是去某台机器手动改容器。
+
 ---
 
 ### 5. Service 是什么？
@@ -551,6 +715,26 @@ Deployment -> ReplicaSet -> Pod
 - `LoadBalancer`：通过云厂商 LB 暴露
 - `ExternalName`：DNS 别名映射
 
+Service 由两部分组成：**稳定名字 / 虚拟入口**，以及**一组随 Pod 变化的可用后端**。它一般通过 label selector 找 Pod；只有就绪的 Pod 才应进入 EndpointSlice（端点切片）并接收流量。
+
+```text
+调用方访问 order.default.svc.cluster.local:80
+                  |
+                  v
+       Service：稳定 DNS + ClusterIP + selector: app=order
+                  |
+                  v
+ EndpointSlice：当前就绪的 Pod IP 列表
+                  |
+                  v
+ 节点网络转发规则（常见 kube-proxy 或 CNI 的实现）
+                  |
+                  v
+        Pod A / Pod B / Pod C
+```
+
+所以要区分两个问题：Service 解决“**稳定地找到哪一组后端**”，负载均衡实现负责“**一次请求具体转到哪个后端**”。如果 Service 访问失败，先查 selector 是否匹配 Pod 标签、Pod 是否 Ready、EndpointSlice 是否有地址，再查 DNS / 网络策略 / 端口，而不是先怀疑容器本身。
+
 ---
 
 ### 6. Ingress 是什么？
@@ -568,6 +752,18 @@ Deployment -> ReplicaSet -> Pod
 
 > `Service` 更像服务内部稳定入口，`Ingress` 更像集群外部 HTTP/HTTPS 入口路由层。
 
+注意：Ingress 是一份“路由规则”对象，**自己并不处理请求**；还必须有已经安装并运行的 Ingress Controller（例如 NGINX Ingress Controller 或云厂商实现）去 watch 规则并配置真实的代理 / 负载均衡器。
+
+```text
+浏览器 https://app.example.com/api/orders
+       -> 外部 LB（可选）
+       -> Ingress Controller（TLS 终止、按 host/path 匹配）
+       -> Service order-api
+       -> 就绪的 Pod
+```
+
+Ingress 主要面向 HTTP / HTTPS 七层路由。TCP、UDP、非 HTTP 协议，或者需要更复杂的 API 网关能力时，要看具体 Controller、Gateway API 或专门网关的能力，不能笼统说“Ingress 可以代理任何流量”。
+
 ---
 
 ### 7. ConfigMap 和 Secret 是什么？
@@ -579,6 +775,10 @@ Deployment -> ReplicaSet -> Pod
 
 - 环境变量
 - 文件
+
+两者都只是 K8s API 对象，区别在于使用意图与权限控制：Secret 会以适合敏感数据的方式处理，并应限制 RBAC 读取权限；但它**不等于自动端到端加密的密码箱**。例如把 Secret 直接打印到日志、写进镜像、给所有 ServiceAccount 读取，依然会泄露。
+
+实践上，普通配置变更是否能让已运行应用自动看到，取决于注入方式和应用是否会重载：环境变量通常需要重建 Pod；以 volume 挂载的 ConfigMap / Secret 会被 kubelet 异步更新文件，但业务进程仍要自己监听或重载配置。
 
 ---
 
@@ -610,26 +810,107 @@ PVC = 你提交的领货单
 StorageClass = 货物类别 / 供货规则
 ```
 
-### 9. 一个 Pod 怎样从 YAML 变成真正运行的容器？
-
-这条链路把前面的组件串起来：
+若使用动态供给，链路通常是：
 
 ```text
-客户端 / Controller
-  -> API Server（认证、鉴权、准入校验）
-  -> etcd（持久化期望状态；Pod 尚未绑定 Node）
-  -> Scheduler（按 requests、可用资源、亲和/反亲和、污点容忍等过滤和打分）
-  -> 写回 Pod.spec.nodeName
-  -> 目标 kubelet（watch 到分配给本机的 Pod）
-  -> CRI / container runtime（创建 Pod sandbox、拉镜像、创建容器）
-  -> CNI（创建网络命名空间、配置网卡 / IP / 路由）
-  -> CSI（若使用 PVC，则挂载存储卷）
-  -> 探针通过；readiness 就绪后才接入 Service 流量
+Pod 引用 PVC
+  -> PVC 指定 StorageClass（例如高性能 SSD）
+  -> 对应 CSI Driver 创建 / 选择真实后端卷
+  -> PVC 与 PV 绑定
+  -> kubelet / CSI 在目标 Node 挂载卷，再挂进容器目录
 ```
 
-- `scheduler` 只选 Node，不负责拉镜像或启动容器；节点执行者是 `kubelet`。
-- `CRI` 是 kubelet 与 containerd、CRI-O 等 container runtime 的接口。
-- `CNI` 管网络，`CSI` 管存储；CSI 仅在需要卷时参与，二者不能混为一谈。
+这张图能帮你避免两个常见误解：第一，PVC 不是目录，而是“存储需求的声明”；第二，PVC 绑定成功不等于应用已能读写，仍可能在节点挂载、权限、文件系统或应用路径上失败。
+
+### 9. 一个 Pod 怎样从 YAML 变成真正运行的容器？
+
+这题建议按“**声明被接收 → 控制器造 Pod → Scheduler 选节点 → kubelet 在节点落地 → 网络/存储准备 → 就绪后接流量**”讲。这样既有主线，也不会把每个组件的职责说反。
+
+先分清两种提交：你可以直接提交一个 Pod YAML；生产更常见的是提交 Deployment YAML。后者不会立即出现容器，而是先由 Deployment 控制器创建 ReplicaSet，再由 ReplicaSet 创建 Pod。两种情况从“Pod 已被创建但还没分配节点”开始，后半段一致。
+
+```text
+                 ① 声明与持久化（控制面）
+kubectl apply Deployment.yaml
+          |
+          v
+ API Server：认证 -> 鉴权(RBAC) -> 准入(默认值 / 策略 / Webhook) -> 字段校验
+          |
+          v
+ etcd：保存 Deployment 的期望状态与 resourceVersion
+          |
+          v
+ Deployment Controller --watch--> 创建 ReplicaSet --watch--> 创建 Pending Pod
+
+                 ② 调度（只做“选哪台机器”）
+ Pending Pod（spec.nodeName 为空）
+          |
+          v
+ Scheduler：过滤不合格 Node -> 给候选 Node 打分 -> Bind
+          |
+          v
+ API Server / etcd：Pod.spec.nodeName = node-b
+
+                 ③ 节点落地（真正“起容器”）
+ node-b 上的 kubelet --watch--> 看到分给自己的 Pod
+          |
+          +--> 准备 volume：需要持久盘时协调 CSI Driver 挂载
+          +--> 通过 CRI 请求 containerd / CRI-O 创建 Pod sandbox
+          |       \-> runtime 调用 CNI 插件，建立 Pod 网络、分配 IP、配置路由
+          +--> 拉取镜像 -> 创建 initContainers（按顺序成功结束）
+          +--> 创建并启动业务 containers / sidecar，按 cgroups 设置资源限制
+          |
+          v
+ kubelet 持续把 PodStatus、容器状态、探针结果回写 API Server
+
+                 ④ 变成“可接流量的服务”
+ readiness probe 成功
+          -> EndpointSlice 记录该 Pod 为可用后端
+          -> Service / DNS / 节点转发规则将请求送到该 Pod
+```
+
+#### 每一步谁做、做完看到什么
+
+| 阶段 | 真正的执行者 | 关键动作 | 常见可观察状态 |
+| --- | --- | --- | --- |
+| 1. 接收声明 | `kube-apiserver` | 验证请求；把 API 对象写入 etcd。 | `kubectl get deploy/pod` 能看到对象；错误则在 apply 阶段返回。 |
+| 2. 补出 Pod | Deployment / ReplicaSet Controller | 发现期望副本大于实际副本，创建 Pod 对象。 | Pod 出现，常为 `Pending`。 |
+| 3. 选择节点 | `kube-scheduler` | 根据 `requests`、剩余资源、节点选择器、亲和 / 反亲和、污点与容忍等过滤、打分并绑定。 | `spec.nodeName` 有值；`describe pod` Events 有 `Scheduled`。 |
+| 4. 准备节点资源 | 目标 Node 的 `kubelet`、CSI Driver | 拉取 Secret / ConfigMap，若有 PVC 则准备并挂载卷。 | 失败常见 `FailedMount`、`FailedAttachVolume`。 |
+| 5. 建 sandbox 与网络 | runtime + CNI 插件 | 创建 Pod sandbox（共享网络的运行边界）；配置网络命名空间、veth、IP、路由、网络策略等。 | 失败可能停在 `ContainerCreating`，Events 常有 CNI 错误。 |
+| 6. 启动容器 | `kubelet` 经 CRI 调用 runtime | 拉镜像；init container 顺序执行；再启动 app container 和 sidecar。 | `Pulling` / `Pulled` / `Created` / `Started`，或 `ImagePullBackOff`、`CrashLoopBackOff`。 |
+| 7. 加入流量 | kubelet + EndpointSlice 相关控制器 + Service 网络实现 | readiness 成功后才把它列为可用后端。 | `Running` 不一定 `Ready`；`kubectl get endpointslice` 可验证后端。 |
+
+#### 三个必须讲对的细节
+
+1. **Scheduler 不创建容器。**它只给 Pending Pod 写入绑定结果（目标 Node）；真正拉镜像、调用 runtime、启动容器的是该 Node 的 kubelet。
+2. **etcd 不直接给组件“发命令”。**它是 API 对象的一致性存储；各组件经 API Server 用 List / Watch 观察变化，再按职责采取动作。
+3. **`Running` 不等于已对外可用。**容器进程启动后 Pod 可以是 Running，但 readiness 未通过、Service selector 不匹配或 EndpointSlice 未更新时，请求仍不会被正常转给它。
+
+#### 面试中可直接复述的 60 秒版本
+
+> 以 Deployment 为例，`kubectl apply` 先把声明交给 API Server。API Server 做认证、RBAC 鉴权、准入和校验后，把 Deployment 持久化到 etcd。Deployment 和 ReplicaSet 控制器通过 API Watch 发现期望副本，创建还没有绑定节点的 Pending Pod。Scheduler 根据资源 request、亲和性、污点容忍等筛选并打分，只负责选出 Node 并绑定。目标节点上的 kubelet watch 到这个 Pod 后，先准备 ConfigMap、Secret 和可能的 PVC，然后通过 CRI 调 containerd 等 runtime 创建 Pod sandbox；runtime 调 CNI 配网络，CSI 在需要时挂存储；接着拉镜像、依次跑 init container、启动业务容器。kubelet 上报状态并执行 probes，readiness 成功后 EndpointSlice 更新，Service 才把流量导到这个 Pod。Scheduler 只调度，kubelet 才是节点上的实际执行者。
+
+#### 它卡住时怎么排查：先按所处阶段缩小范围
+
+```text
+对象不存在 / apply 失败       -> YAML、认证、RBAC、准入策略
+Pod 一直 Pending              -> Scheduler 事件：资源、污点、亲和性、PVC 未绑定
+ContainerCreating 很久        -> 镜像、CNI、CSI、节点磁盘 / runtime
+ImagePullBackOff              -> 镜像名 / digest、Registry 权限、imagePullSecrets、网络
+CrashLoopBackOff              -> 应用日志、退出码、命令、配置、依赖、端口
+Running 但访问不到            -> readiness、Service selector、EndpointSlice、端口、网络策略
+```
+
+新手先用这四条命令，不要凭感觉猜：
+
+```bash
+kubectl get pod -o wide                  # 看 Pod 状态和被调度到哪个 Node
+kubectl describe pod <pod-name>          # 重点看最下方 Events
+kubectl logs <pod-name> -c <container>   # 看当前容器日志
+kubectl logs <pod-name> -c <container> --previous  # 容器重启过时看上一次日志
+```
+
+`CNI`（Container Network Interface，容器网络接口）负责网络；`CSI`（Container Storage Interface，容器存储接口）负责存储；`CRI`（Container Runtime Interface，容器运行时接口）是 kubelet 调 runtime 的接口。最短记忆法：**CRI 起容器，CNI 配网络，CSI 挂存储。**
 
 ### 10. Pod 的 CPU、内存怎样隔离？
 
@@ -643,11 +924,25 @@ StorageClass = 货物类别 / 供货规则
 
 ### 11. CNI、CSI 和 RuntimeClass 分别解决什么？
 
-- `CNI`：给 Pod 配网络，如网卡、IP、路由与网络策略落地。
-- `CSI`：让 PVC 对接云盘、NFS、Ceph 等存储，并完成挂载。
-- `RuntimeClass`：为 Pod 选择不同 container runtime 配置；需要更强隔离的工作负载可以选择基于轻量虚拟化或 sandbox 的运行时，调度器也能计入额外开销。
+这三个词很像，但分别在三条完全不同的链路上。先记全称：
 
-它们分别位于网络、存储和运行时隔离三层，不能把“装了 CSI”理解成网络打通，或把“用了容器”理解成天然强安全隔离。
+| 名词 | 英文全称 / 中文 | 谁调用谁 | 解决的问题 |
+| --- | --- | --- | --- |
+| `CNI` | **Container Network Interface，容器网络接口** | runtime 在创建 Pod sandbox 时调用 CNI Plugin。 | 给 Pod 建网络命名空间、网卡、IP、路由；网络策略也常由相应网络方案落实。 |
+| `CSI` | **Container Storage Interface，容器存储接口** | kubelet 与 CSI Driver 协作。 | 将 PVC 对应的云盘、NFS、Ceph 等真实存储创建、附着、挂载进 Pod。 |
+| `RuntimeClass` | Runtime Class，**运行时类别** | Pod 在 `spec.runtimeClassName` 选择；kubelet / runtime 据此选配置。 | 让不同工作负载选择不同 runtime handler 或隔离配置，例如更强的 sandbox 运行时。 |
+
+```text
+同一个 Pod 被分到 Node 后
+
+kubelet --CRI（容器运行时接口）--> runtime --> CNI Plugin --> 获得 Pod 网络
+   |
+   +--PVC / PV--> CSI Driver --> 后端盘 / NFS / Ceph --> 挂到容器目录
+   |
+   +--runtimeClassName（可选）--> 选择 runtime handler / 隔离配置
+```
+
+它们分别位于网络、存储和运行时隔离三层。不要把“装了 CSI”理解成网络打通，也不要把“Pod 拿到 IP”理解成 PVC 已可用；一个 Pod 可能没有 PVC，因此 CSI 不参与，但每个正常联网的 Pod 都需要某种网络配置。RuntimeClass 也不是“给容器加一个名字”，它会影响底层运行时选择、调度开销或隔离边界，取决于集群管理员的配置。
 
 ---
 
@@ -714,6 +1009,21 @@ Watch 不是可靠消息队列：消费者要保存 revision，遇到 compaction
 - Redis：缓存和高性能数据访问很强，也可实现简单注册 / 锁，但不能因为它快就忽略一致性、故障转移和锁语义。
 
 不要回答“谁绝对更好”。先看目标是强一致协调、生态兼容、吞吐延迟还是实现复杂度；Kubernetes 控制面选择 etcd 的关键是保存一致的集群元数据，不是追求存业务大数据。
+
+### 6. etcd 为什么要奇数节点？节点故障和备份怎么回答？
+
+etcd 使用 Raft 多数派提交。3 个节点需要 2 个节点在线，5 个节点需要 3 个节点在线；因此从“可容忍故障数”看，3 节点可坏 1 个，4 节点也仍只可坏 1 个，5 节点才可坏 2 个。4 个节点比 3 个节点多消耗资源、写入确认更多，却没有提高多数派容错能力，所以常部署为 3 或 5 个节点，并尽量跨可用区 / 故障域。
+
+```text
+3 节点：A、B、C，写成功需多数派 = 2
+
+A 挂掉：B + C 仍是 2，能选 Leader、能写
+A、B 挂掉：只剩 C，不足 2，拒绝写，避免产生两份冲突状态
+```
+
+备份不是“把某台机器上的数据目录随手复制走”这么简单。生产应该定期执行一致性快照、验证快照可用，并演练在隔离环境恢复；恢复后还要按集群 / 控制面流程重新建立成员关系，不能把旧数据目录直接覆盖到还在运行的集群。另一个常见运维概念：**compaction（压缩历史 revision）**用于清理旧版本事件，避免数据库无限增长；**defragmentation（碎片整理）**用于回收已经不再使用的磁盘空间。二者都要结合集群版本、磁盘与业务窗口审慎操作。
+
+面试回答可以收束为：**“etcd 用奇数节点是为了用最少节点得到所需多数派容错；高可用不等于不备份，要做一致性快照、恢复演练，并监控 leader 变化、磁盘延迟、空间和 quorum。”**
 
 ---
 
@@ -796,9 +1106,9 @@ Watch 不是可靠消息队列：消费者要保存 revision，遇到 compaction
 
 ---
 
-## 七、高频面试题：用基础知识组织成短答
+## 七、高频面试题：按“结论 → 原理 → 易错点”作答
 
-> 第二、三章负责把概念讲透；本章不再重复教材，而是给出面试时的回答顺序、易错点和进阶追问。复习时先读基础，再用这一章自测。
+> 第二、三章负责把概念讲透；本章把它压缩成面试时可讲的 30～60 秒答案。每题先说结论，再说关键机制，最后主动补一个易错点或排查点；不会显得只会背定义。看到不认识的缩写，回到第一章的“缩写导航”查其全称与层次。
 
 ### A. Docker 与容器
 
@@ -832,7 +1142,9 @@ Watch 不是可靠消息队列：消费者要保存 revision，遇到 compaction
 
 **答案：**
 
-Pod 是最小调度单元，通常包含一个主容器，也可包含强关联 sidecar；它们共享 Pod 网络和可共享 Volume。回答时说清“Pod 是调度边界，不等于一个容器”即可。
+Pod 是 K8s 的最小调度单位，不等于一个容器。一个 Pod 最常见是一个业务容器，也可以放主容器加 sidecar；同 Pod 内的容器共享一个 Pod IP 和网络命名空间，也可以挂同一个 Volume，所以适合表达“必须一起部署、一起协作”的进程组。
+
+例如业务容器将日志写进 `emptyDir`，日志 sidecar 从同一目录采集；它们必须被调度到同一 Node，且可用 `localhost` 通信。不要把两个可独立发布、独立扩缩容的微服务为了“通信方便”塞进同一 Pod——那会把故障域和伸缩策略错误绑定。
 
 ---
 
@@ -840,7 +1152,11 @@ Pod 是最小调度单元，通常包含一个主容器，也可包含强关联 
 
 **答案：**
 
-按“API Server → etcd → Scheduler → kubelet → runtime → CNI / CSI → probes”复述即可。最容易失分的是说 Scheduler 在节点上创建容器；实际上 Scheduler 只绑定 Node，kubelet 通过 CRI 落实运行。
+以 Deployment 为例：用户通过 `kubectl apply` 把 YAML 交给 API Server；API Server 完成认证、RBAC 鉴权、准入和校验后，把声明持久化进 etcd。Deployment / ReplicaSet 控制器 watch 到期望副本后创建 Pending Pod。Scheduler 为没有 `nodeName` 的 Pod 按资源 request、亲和性、污点容忍等筛选打分，只把它绑定到合适的 Node。
+
+目标 Node 的 kubelet watch 到这个绑定结果，准备 ConfigMap、Secret 和可能的 PVC；再通过 **CRI（Container Runtime Interface，容器运行时接口）**调用 containerd 等 runtime。runtime 创建 Pod sandbox 并调用 **CNI（Container Network Interface，容器网络接口）**插件配置网络；需要持久卷时，**CSI（Container Storage Interface，容器存储接口）**Driver 负责挂载。随后拉镜像、依次执行 init container、启动业务容器。readiness probe 成功后，EndpointSlice 才将该 Pod 作为 Service 的可用后端。
+
+最重要的纠错：Scheduler 只“选 Node”，不创建容器；etcd 只“存状态”，不下发命令；kubelet 才是节点上的执行者。完整时序图、状态和排障树见第三章第 9 节。
 
 ---
 
@@ -848,7 +1164,9 @@ Pod 是最小调度单元，通常包含一个主容器，也可包含强关联 
 
 **答案：**
 
-Deployment 声明副本数与发布策略，底层通过 ReplicaSet 维持 Pod 数量；Pod 才是实际承载容器的单位。回答时可补充滚动升级、暂停与回滚都是 Deployment 层的职责。
+Deployment 是上层的“期望状态和发布策略”，Pod 是真正运行容器、被调度到 Node 的单位，中间由 ReplicaSet 负责维持某一版本的副本数：`Deployment -> ReplicaSet -> Pod`。例如 Deployment 声明 `replicas: 3`，一个 Pod 崩掉后，ReplicaSet 会创建替代 Pod，让实际副本重新回到 3。
+
+改镜像版本时，Deployment 会创建新的 ReplicaSet，按 `maxSurge`、`maxUnavailable` 等策略逐步扩新、缩旧，等待新 Pod readiness 成功再继续；因此滚动升级、暂停、回滚属于 Deployment 层。不要通过 SSH 到机器手动重启容器，这会让实际状态与声明状态漂移。
 
 ---
 
@@ -856,7 +1174,9 @@ Deployment 声明副本数与发布策略，底层通过 ReplicaSet 维持 Pod �
 
 **答案：**
 
-Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod，并提供稳定的虚拟 IP / DNS 名称；它解决“稳定访问谁”，不直接替代 Ingress 的 HTTP 路由能力。
+Pod 会重建、扩缩容和迁移，Pod IP 与后端数量都可能变化；Service 用 label selector 选择一组 Pod，为调用方提供稳定的 DNS 名和虚拟 IP。只有通过 readiness 的后端才应被记录进 EndpointSlice，Service 的转发实现再从这些地址中选择目标。
+
+因此 Service 解决“稳定访问这一类后端”，不是固定某一个 Pod；调用方应访问 `order-api` 这样的 Service 名，而不是写死 `10.x.x.x`。它也不等同于 Ingress：Service 是服务稳定入口，Ingress / Ingress Controller 处理外部 HTTP / HTTPS 的 host、path、TLS 路由。
 
 ---
 
@@ -868,6 +1188,8 @@ Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod
 - `NodePort`：通过每台 Node 的某个端口暴露
 - `LoadBalancer`：借助云负载均衡对外暴露
 - `ExternalName`：把服务映射到外部 DNS 名称
+
+选择思路：服务只供集群内调用时先选 `ClusterIP`；临时测试可使用 `NodePort`，但要承担端口暴露和节点地址管理；云上对外服务通常用 `LoadBalancer` 或 Ingress；需要给外部已有域名取一个集群内别名时选 `ExternalName`。`ExternalName` 只返回 DNS CNAME，不会自动产生 Pod 转发和健康检查。
 
 ---
 
@@ -883,6 +1205,8 @@ Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod
 
 > liveness 管“要不要重启”，readiness 管“要不要接流量”，startup 管“启动慢时别太早误杀”。
 
+典型配置方式是：慢启动的 Java / 模型服务先配 startup probe；启动成功前，liveness 和 readiness 不会过早判失败。应用已经启动但依赖未就绪时，让 readiness 失败以摘流量，而不是让 liveness 失败反复重启。探针地址不要只写“进程存在”，更不要在每次探测里访问会导致级联压力的重依赖；它应能表达本服务是否真的可安全接流量。
+
 ---
 
 #### 10. OOMKilled 和 CrashLoopBackOff 是什么？
@@ -892,12 +1216,9 @@ Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod
 - `OOMKilled`：容器因为内存超限被系统杀掉
 - `CrashLoopBackOff`：容器反复启动、反复崩，K8s 进入退避重试状态
 
-排查时先看：
+两者关系也不同：OOMKilled 是一次明确的内核内存杀进程原因；CrashLoopBackOff 是“容器连续启动失败后，kubelet 逐渐延长重试间隔”的状态，OOMKilled、配置错误、端口冲突、依赖不可用都可能导致它。
 
-- `kubectl describe pod`
-- `kubectl logs`
-- 资源限制 `requests/limits`
-- 程序启动参数、配置、依赖是否正常
+排查顺序是：`kubectl describe pod` 看状态、退出码和 Events；`kubectl logs <pod> --previous` 看上一次崩溃日志；再核对 `requests/limits`、启动命令、ConfigMap / Secret、依赖连通性与健康检查。不要把增加内存当成所有 CrashLoop 的解法；先确认真正的退出原因。
 
 ---
 
@@ -905,7 +1226,9 @@ Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod
 
 **答案：**
 
-按“request 决定能否调度，limit 决定运行上限，cgroups 真正执行”回答。CPU 超限通常是 throttling，内存超限风险是 OOM Kill；不要把 Kubernetes Namespace 误说成 Linux namespace 或强安全隔离。数值例子和完整链路见第三章第 10 节。
+`requests` 是容器申请并让 Scheduler 计入调度的资源量；Node 没有足够可分配 request 时，Pod 会 Pending。`limits` 是运行时上限，kubelet 将它交给 runtime，再由 Linux cgroups（控制组）执行。CPU 用超通常表现为 throttling（被限速），内存超过 limit 则可能被内核 OOM Kill。
+
+例如一个 Pod 的容器 `request: 500m, 512Mi`、`limit: 1 CPU, 1Gi`：Scheduler 至少要为它找到还剩半核、512Mi 可分配资源的 Node；运行中可以短时使用到一核和 1Gi，超过 CPU 上限会变慢，内存继续膨胀则有被杀风险。request 不是“保证永远拿到的 CPU”，limit 也不是“内存到了就一定优雅报错”。
 
 ---
 
@@ -921,7 +1244,9 @@ Pod IP 与副本数会变化，Service 以 label selector 选择一组就绪 Pod
 
 **答案：**
 
-PV 是集群可供给的存储资源，PVC 是工作负载的存储申请，Pod 引用 PVC 而非直接绑定底层盘。StorageClass 可提供动态供给策略；三者的类比和基础定义见第三章第 8 节。
+PV（PersistentVolume，持久卷）是集群可提供的真实存储资源；PVC（PersistentVolumeClaim，持久卷声明）是应用提出的容量、访问模式、存储类型需求；Pod 引用 PVC，而不是直接操作底层云盘。StorageClass（存储类）规定动态供给策略，例如由哪个 CSI Driver 创建什么性能等级的盘。
+
+可按“PVC 申请 → StorageClass / CSI 供给或匹配 PV → PVC 与 PV 绑定 → kubelet 挂到 Pod”讲。常见排障不是只看 Pod：PVC 一直 Pending 先查 StorageClass、容量和 CSI provisioner；PVC 已 Bound 但容器起不来，再查 attach / mount Events、节点与卷的限制、文件权限。
 
 ---
 
@@ -929,7 +1254,9 @@ PV 是集群可供给的存储资源，PVC 是工作负载的存储申请，Pod 
 
 **答案：**
 
-CSI 是容器存储接口，Driver 将 PVC 的请求落到具体云盘、NFS、Ceph 等存储，并负责挂载。它与负责 Pod 网络的 CNI 是两条不同链路，见第三章第 11 节。
+CSI 是 **Container Storage Interface（容器存储接口）**。CSI Driver 把 Kubernetes 的 PVC / PV 需求对接到具体后端，例如云盘、NFS、Ceph，并完成动态创建、附着、节点挂载等动作。它解决“存储如何进入 Pod”，不解决网络。
+
+与其成对记忆的是 CNI：CNI 是 **Container Network Interface（容器网络接口）**，给 Pod 配 IP、路由和网络能力。口诀仍是：**CRI 起容器，CNI 配网络，CSI 挂存储。**
 
 ---
 
@@ -937,12 +1264,12 @@ CSI 是容器存储接口，Driver 将 PVC 的请求落到具体云盘、NFS、C
 
 **答案：**
 
-- `kubelet`：节点执行者，负责让本机 Pod 实际运行并上报状态。
-- `scheduler`：为未绑定 Node 的 Pod 选择合适节点。
-- `kube-proxy`：维护 Service 转发相关规则。
-- `etcd`：控制面的一致性状态存储，不是直接给业务服务做注册发现。
+- `kubelet`：每个 Node 上的节点代理，watch 分给本机的 Pod，通过 CRI 调 runtime 落实运行、执行探针并上报状态。
+- `scheduler`：为还没有 `nodeName` 的 Pod 选择合适 Node，依据 request、调度约束等过滤与打分；它不启动容器。
+- `kube-proxy`：维护 Service 到 EndpointSlice 后端的转发规则；不同代理模式底层实现可以不同。
+- `etcd`：控制面强一致状态存储，保存 API 对象；不是镜像仓库，也不是业务服务直接做注册发现的数据库。
 
-顺序要讲对：期望状态经 API Server 写入 etcd，Scheduler 绑定 Node，kubelet 再落地运行。
+顺序要讲对：期望状态经 API Server 写入 etcd，Controller 造出 Pod，Scheduler 绑定 Node，kubelet 再落地运行；组件不应绕过 API Server 直接改 etcd。
 
 ---
 
@@ -952,7 +1279,9 @@ CSI 是容器存储接口，Driver 将 PVC 的请求落到具体云盘、NFS、C
 
 **答案：**
 
-etcd 是 Kubernetes 的强一致状态存储，保存 API 对象的持久化状态；它不是给业务服务直接查询实例地址的注册中心。业务服务发现通常通过 Service 与 CoreDNS，kube-proxy 或网络实现实际转发。正常情况下组件经 API Server 间接使用 etcd，不能绕过 API Server 直接改 etcd。
+etcd 是 Kubernetes 的强一致 KV（Key-Value，键值）状态存储，保存 Pod、Node、Deployment、Service、Secret 等 API 对象的持久化状态。它不是给业务服务直接查询实例地址的服务注册中心：集群内服务发现通常靠 Service 和 CoreDNS（集群 DNS 服务），实际流量由 kube-proxy 或 CNI 网络实现转发。
+
+正常路径是 Controller、Scheduler、kubelet 都通过 API Server 间接读写 etcd；业务程序或普通组件绕过 API Server 直接改 etcd，会跳过认证、鉴权、准入和对象校验，可能破坏控制面一致性。
 
 #### 17. etcd 为什么偏 CP？Raft 写入如何成功？
 
@@ -964,7 +1293,9 @@ etcd 是 Kubernetes 的强一致状态存储，保存 API 对象的持久化状�
 
 **答案：**
 
-Watch 推送 key / 前缀变更，适合控制器感知对象变化；Lease 给临时 key 附加 TTL，未 keepalive 时自动过期，适合存活检测或协调。Watch 消费端要保存 revision，遇到 compaction 或连接断开时重新 List + Watch；Lease 不是万能分布式锁，涉及外部副作用仍要配合版本校验 / fencing token。
+Watch 是订阅 key 或前缀变更的机制，适合控制器及时感知对象变化；Lease（租约）给临时 key 附加 TTL（Time To Live，生存时间），客户端不再 keepalive 时 key 自动过期，适合实例临时注册、选主等协调状态。
+
+Watch 不是 MQ（Message Queue，消息队列）：消费者要保存 revision（版本序号），连接断开或历史被 compaction 清理后，要重新 List 得到当前全量状态，再从新的 revision 继续 Watch；业务处理也要幂等。Lease 也不是万能分布式锁，若持锁者对外部系统有副作用，仍应配合版本校验或 fencing token（栅栏令牌）防止旧持有者“复活后继续写”。
 
 ### D. Docker、Kubernetes、etcd 如何协作
 
@@ -1126,7 +1457,15 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 13. etcd API Guarantees  
     https://etcd.io/docs/v3.5/learning/api_guarantees/
 14. etcd Distributed Coordination  
-    https://etcd.io/docs/v3.6/learning/why/
+   https://etcd.io/docs/v3.6/learning/why/
+15. Kubernetes Controllers（控制器如何通过 API 收敛状态）  
+   https://kubernetes.io/docs/concepts/architecture/controller/
+16. Kubernetes Compute / Storage / Networking Extensions（CNI、CSI 等扩展）  
+   https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/
+17. Kubernetes Persistent Volumes（PV、PVC、StorageClass）  
+   https://kubernetes.io/docs/concepts/storage/persistent-volumes/
+18. etcd Disaster Recovery（快照、恢复与 quorum）  
+   https://etcd.io/docs/v3.7/op-guide/recovery/
 
 ### 公开面经 / 公开讨论（牛客为主）
 
