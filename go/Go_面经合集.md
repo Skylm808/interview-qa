@@ -938,6 +938,113 @@ func runPhase(ctx context.Context, jobs []Job, workers int) ([]Result, error) {
 
 > 线程池设计的核心不是“把 goroutine 放进池子”这么简单，而是要控制并发、平衡吞吐和资源占用。一般会有任务队列和固定 worker，CPU 密集任务的 worker 数量更接近核数，IO 密集任务可以更高。如果要动态调整，我会根据队列积压、平均耗时、失败率做扩缩，但一定会设上下限，避免池子本身变成新的问题源。  
 
+### 20.1 Go 怎么实现一个环形队列？
+
+环形队列（ring buffer / circular queue）使用固定长度数组，把逻辑尾部“绕回”数组开头复用空间。它适合**容量明确、希望避免频繁扩容和搬移元素**的缓冲区，例如连接发送队列、日志缓冲、有限任务队列。
+
+```text
+容量 = 5，buf 下标： 0   1   2   3   4
+                     [ A | B | C | _ | _ ]
+                       ^           ^
+                      head        tail（下一个写入位置）
+
+Dequeue A 后，再 Enqueue D、E、F：
+                     [ F | B | C | D | E ]
+                           ^               ^
+                          head            tail
+```
+
+#### 一、核心状态：`head`、`tail`、`size`
+
+- `head`：下一个要读的位置；
+- `tail`：下一个要写的位置；
+- `size`：当前元素数；
+- `capacity = len(buf)`：固定容量。
+
+写入和读取后都用 `(index + 1) % capacity` 前进。保留 `size` 的好处是清楚地区分“队列为空”和“队列已满”：二者都可能出现 `head == tail`，只看两个指针会歧义。另一种实现是额外浪费一个数组槽位，但面试里把 `size` 说清楚最直观。
+
+```go
+package ring
+
+import "sync"
+
+// Ring 是固定容量、线程安全的泛型环形队列。
+// Enqueue 满时返回 false：调用方必须选择丢弃、降级、等待或转持久队列，
+// 而不是让内存无限增长。
+type Ring[T any] struct {
+	mu   sync.Mutex
+	buf  []T
+	head int // 下一个读取位置
+	tail int // 下一个写入位置
+	size int
+}
+
+func New[T any](capacity int) *Ring[T] {
+	if capacity <= 0 {
+		panic("ring capacity must be positive")
+	}
+	return &Ring[T]{buf: make([]T, capacity)}
+}
+
+func (r *Ring[T]) Enqueue(v T) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.size == len(r.buf) { // full
+		return false
+	}
+	r.buf[r.tail] = v
+	r.tail = (r.tail + 1) % len(r.buf)
+	r.size++
+	return true
+}
+
+func (r *Ring[T]) Dequeue() (T, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.size == 0 { // empty
+		var zero T
+		return zero, false
+	}
+	v := r.buf[r.head]
+	var zero T
+	r.buf[r.head] = zero // 清掉引用，避免大对象被队列底层数组继续持有
+	r.head = (r.head + 1) % len(r.buf)
+	r.size--
+	return v, true
+}
+
+func (r *Ring[T]) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.size
+}
+
+func (r *Ring[T]) Cap() int { return len(r.buf) }
+```
+
+复杂度是：入队、出队、读取长度均为 `O(1)`，空间为 `O(capacity)`。清空出队槽位这行在存放指针、`[]byte`、大 struct 引用时很重要，否则虽然逻辑上已出队，底层数组仍可能让对象无法被 GC 回收。
+
+#### 二、线程安全与生产语义怎么选？
+
+上面的 `Mutex` 版本适合先保证正确性。不要以为“数组下标加一”天然线程安全：多个生产者会同时写同一个 `tail`，多个消费者也可能重复读同一个 `head`。高吞吐的单生产者单消费者（SPSC）确实可以用 atomic 实现无锁 ring buffer，但要处理内存可见性、伪共享、ABA / 覆盖语义，除非性能数据证明锁是瓶颈，否则面试中先给有界 Mutex 方案更稳。
+
+还要主动说清“满时怎么办”：
+
+| 场景 | 满队列策略 |
+| --- | --- |
+| 日志、鼠标移动、在线状态等可丢事件 | 丢最旧或丢最新，并累计 drop 指标。 |
+| 在线聊天实时推送 | 停止向该慢连接推送，记录 sequence，改为重连后拉取。 |
+| 必须可靠的业务任务 | 不应只放内存 ring；写入 MQ / DB，再以幂等消费者处理。 |
+| 调用方可等待 | 用 `sync.Cond` 或直接使用 buffered channel，实现阻塞与取消。 |
+
+如果问题本质是“多个 goroutine 生产、多个 worker 消费任务”，Go 的 buffered channel 通常更自然：它已有阻塞、关闭和 `select + context` 语义。环形队列更适合需要自定义丢弃策略、批量 drain、固定内存或极低额外开销的底层缓冲；不要为了手写数据结构而替换已经合适的 channel。
+
+**面试回答：**
+
+> 我会用固定数组加 `head`、`tail` 和 `size` 实现环形队列。入队把元素写入 tail 后做取模前移，出队从 head 取元素后清空槽位并取模前移，`size` 用来区分空和满，所以操作都是 O(1)。并发场景先用 Mutex 保证正确性，队列满时一定定义背压语义：可丢消息统计 drop，可靠任务进入 MQ/DB，慢连接改走补拉；不能无界扩容。Go 的一般生产消费优先考虑 buffered channel，只有确实需要固定内存或自定义 ring 行为时再手写。
+
 ---
 
 ### 21. 如何手写一个线程安全的 LRU Cache？
@@ -2699,6 +2806,86 @@ DTO 的字段是固定的，`items` 是一段连续的结构体列表，不必�
 > 我会把 GC 问题理解成“垃圾产生得太快，还是存活对象太多”。高分配时后台 GC 跟不上，业务 goroutine 会做 GC assist，直接拖慢 p99。先用 profile 找是临时对象、缓存还是泄漏协程，再改业务代码减少垃圾；比如订单列表从 `map[string]any` 改为 DTO，减少每条订单的动态对象。最后才根据压测结果调整 `GOGC` 和 `GOMEMLIMIT`，而不是一开始就调参数。
 
 ---
+
+### 39.1 “GC 导致 OOM”怎么排查？
+
+先纠正表述：**GC 的职责是回收不可达对象，它通常不是 OOM 的根因。**线上看到“GC 很频繁 + 最后 OOM”，更常见的解释是：活对象太多回收不了、分配峰值超过容器余量、Go 堆外内存也在增长，或者内存上限设置不合理。GC 只能在“对象已经不可达”时回收，不能替你回收仍被缓存、goroutine、全局变量或 C 库持有的内存。
+
+```text
+容器 memory limit = 2 GiB
+
+RSS（进程真实占用） = Go heap + goroutine stacks + runtime 元数据
+                  + cgo / mmap / byte buffer + page cache 等
+
+若 RSS 接近 2 GiB
+  -> 内核 / cgroup OOM Kill（常见 exit code 137、Pod 显示 OOMKilled）
+
+若 HeapAlloc 一直涨、GC 后也不降
+  -> 多半是“仍然可达”的对象，而不是 GC 没跑
+```
+
+#### 第一步：先确认是哪一种 OOM，别一上来调 `GOGC`
+
+| 现象 | 证据 | 含义 / 下一步 |
+| --- | --- | --- |
+| Pod / 容器显示 `OOMKilled` | `kubectl describe pod`、退出码常为 137、节点事件 | cgroup 到了容器 limit；同时查容器 working set 与 Go 进程指标。 |
+| 进程打印 `runtime: out of memory` | 应用 stderr、core / 日志 | Go runtime 分配失败；仍需核对进程地址空间、OS 限制和容器 limit。 |
+| Node OOM / 被驱逐 | Node Events、内核日志、Pod QoS / eviction 信息 | 可能是整机内存压力，不是单个 Go 堆问题。 |
+| RSS 高但 `HeapAlloc` 不高 | 容器内存高，Go heap profile 却不大 | 优先查 cgo、mmap、goroutine 栈、`[]byte` buffer、文件页缓存、其他进程。 |
+
+#### 第二步：把“堆、进程、容器、GC”放到同一时间线
+
+```text
+时间 ─────────────────────────────────────────►
+container RSS / working set     ▁▂▃▅▆█  OOM
+HeapAlloc                       ▁▂▃▅▆█  （heap 泄漏？）
+HeapInuse - HeapAlloc           ▁▁▆▆▁   （碎片 / 分配峰值？）
+GC 次数、GC CPU、assist         ▁▂▅██   （GC 在追赶分配？）
+goroutine / queue / 请求并发     ▁▁▂▅█   （积压或并发放大？）
+```
+
+重点不是孤立看一个 `heap_alloc`，而是回答四个问题：
+
+1. **GC 后的存活堆基线是否持续抬升？**持续抬升说明对象仍被引用，优先怀疑缓存、map、队列、全局引用、未退出 goroutine。
+2. **分配速率是否突然冲高？**短生命周期对象过多也可能让 RSS 在 GC 来得及回收前冲到 limit；结合 `alloc_space`、QPS、批大小、并发数查。
+3. **进程 RSS 与 Go 堆是否不匹配？**不匹配说明不能只看 heap pprof，需要查堆外内存与容器层。
+4. **GOMEMLIMIT 是否给非堆内存留了余量？**若把它等于容器 limit，runtime 即使努力压堆，也无法为栈、运行时元数据、网络 buffer、cgo 等留空间。
+
+常用证据：`runtime/metrics` 或 Prometheus 的 Go 指标、容器 working set / RSS、`go_memstats_heap_alloc_bytes`、`go_memstats_heap_inuse_bytes`、`go_memstats_heap_sys_bytes`、GC 次数/CPU、goroutine 数、队列长度。发生前后各抓一份 heap profile：
+
+```bash
+# 看目前仍活着、真正占空间的对象：缓存/泄漏优先看它
+go tool pprof http://<host>:6060/debug/pprof/heap
+
+# 看累计分配最多的对象：短命垃圾和分配风暴优先看它
+go tool pprof -alloc_space http://<host>:6060/debug/pprof/heap
+
+# 对比两次快照，找“持续增长”而非某一次瞬时大对象
+go tool pprof -base heap-before.prof heap-before-oom.prof
+```
+
+#### 第三步：按现象分类定位
+
+| 模式 | 典型根因 | 怎样证明 | 修复方向 |
+| --- | --- | --- | --- |
+| GC 后 HeapAlloc 仍一路上涨 | 无上限本地缓存、map 未删、队列积压、goroutine 持有大对象 | `inuse_space` 对比持续增长；goroutine dump 显示相同阻塞栈累积 | 容量 / TTL / 淘汰；队列上限与背压；`context` 取消、停止 worker。 |
+| `alloc_space` 极高、存活堆不高 | JSON/字符串/临时 map、大批量一次读入、过大并发 | GC 次数 / CPU / assist 随流量冲高 | 流式处理、DTO、buffer 复用、限制 batch 和并发。 |
+| RSS 很高但 Go heap 不高 | cgo 库、mmap、压缩库、连接 / 文件 buffer、子进程 | 容器 RSS 与 heap 指标差值大；检查 native / OS 指标 | 给堆外内存设预算，升级/修复 native 库，限制 buffer 与子进程。 |
+| 只在发布或流量尖峰 OOM | 新版本内存回归、预热并发、缓存雪崩、重试放大 | 按版本 / 接口 / tenant 对比 allocation 与队列 | canary 内存门禁，限流、熔断、按批预热，回滚异常版本。 |
+| GC 非常勤快但仍 OOM | `GOMEMLIMIT` 太贴近容器上限，或活堆本身已超过预算 | GC CPU 高、可用堆很小、RSS 仍靠近 limit | 先削减活堆；再给非堆余量设置合理 memory limit / `GOMEMLIMIT`。 |
+
+#### 最小修复原则
+
+1. **先止血**：降入口并发 / 批大小、暂停异常消费、限制队列、回滚内存回归版本；必要时扩容，但不要把扩容当根因修复。
+2. **先修引用和分配，再调 GC**：给缓存和队列上限、让 goroutine 可取消、把整文件读取改成流式、减少大对象和临时对象。
+3. **再校准内存预算**：容器 limit 必须覆盖 Go heap 之外的开销；`GOMEMLIMIT` 应低于容器 limit，预留多少要按实际 RSS 差值和压测峰值决定，而不是机械设为 90%。
+4. **验证**：压测 / 回放同样流量，比较 OOM 次数、RSS 峰值、GC CPU、p99、`inuse_space` 与 `alloc_space`；只要 GC CPU 降了但 RSS 仍持续涨，就还没有修好。
+
+**面试回答：**
+
+> 我不会直接认定 GC 导致了 OOM。先区分是容器 OOMKilled、Go runtime OOM 还是 Node 内存压力，再把容器 RSS、Go 的 HeapAlloc/HeapInuse、GC CPU、goroutine、队列与流量放在同一时间线。GC 后存活堆持续上升就用 `inuse_space` 查缓存、队列和 goroutine 引用；累计分配暴涨就用 `alloc_space` 查临时对象、批处理和并发；RSS 与 Go heap 不匹配则查 cgo、mmap 和 buffer。先通过限流、队列背压或回滚止血，再修引用/分配，最后才根据容器余量设置 `GOMEMLIMIT` 和 `GOGC`，并用同样压测验证 RSS 峰值和 p99。
+
+关于 `GOGC`、`GOMEMLIMIT` 的准确内存语义和软上限边界，见 [Go 官方 GC 指南](https://go.dev/doc/gc-guide)。
 
 ## 并发故障排查
 

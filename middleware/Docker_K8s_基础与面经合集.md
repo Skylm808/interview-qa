@@ -1383,6 +1383,99 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
 
 发现异常先停止继续放量，切回稳定版本 / 流量；无状态服务可以回滚 Deployment 镜像。若涉及数据库，迁移应优先采用向后兼容的 expand → backfill → contract：新旧版本可同时读写，确认回滚窗口结束后再删除旧字段，不能把不可逆 DDL 和应用全量切换绑成一次操作。
 
+#### 27. K8s 滚动更新时，正在运行的 Agent 服务怎样避免被打断？
+
+先区分两种“服务”：HTTP 请求型 Agent（一次 Run 很短）主要需要连接 drain；任务 / Run 型 Agent（一次调查、代码审查、批量处理可能持续数分钟到数小时）还需要**任务可恢复**。只把 `terminationGracePeriodSeconds` 调大只能延后中断，不能保证节点故障、驱逐、进程 crash 时任务不丢。
+
+```text
+新版本 Pod 启动 -> startup / readiness 通过 -> 加入 Service
+                                      |
+Deployment 缩旧 Pod                  v
+旧 Pod: 先标记 Draining / readiness=false
+      -> EndpointSlice 摘流，不接新 Run
+      -> preStop / SIGTERM：等待当前 HTTP 请求或 Run 到 checkpoint
+      -> 到完成 / 期限：持久化 checkpoint、释放 lease、可重试任务重新入队
+      -> 进程退出；超过 grace period 才会被强制终止
+```
+
+**应用层必须先设计任务状态，不把真相放在内存。**一个 Agent Run 至少持久化 `run_id`、状态、输入版本、当前 plan step、已调用工具的幂等键、checkpoint、worker lease / heartbeat。Worker 收到 drain 或 SIGTERM 后：停止领取新任务；将正在执行的 Run 标记为 `DRAINING`；在安全点保存 checkpoint；有外部副作用的工具按幂等键或 fencing token 防重复；超时未完成则由另一个 worker 在 lease 到期后接管或重试。这样即使不是正常滚动更新而是 Node 直接丢失，也能恢复。
+
+Deployment 侧的典型策略：
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0  # 先保证旧副本不减少到不可用
+    maxSurge: 1        # 容量允许时，先多起一个新副本
+minReadySeconds: 30    # 新 Pod 连续就绪一段时间再继续推进
+template:
+  spec:
+    terminationGracePeriodSeconds: 600
+    containers:
+    - name: agent-worker
+      lifecycle:
+        preStop:
+          httpGet: {path: /drain, port: 8080}
+```
+
+- `/drain` 的语义应是“拒绝新 Run、让 readiness 失败、等待 / checkpoint 旧 Run”，而不是只 `sleep 10`；应用也必须正确处理 `SIGTERM`。
+- `maxUnavailable: 0` 与 `maxSurge: 1` 是可用性优先的例子，代价是发布时需要额外资源；GPU 或昂贵模型无法多起副本时，可能只能分批迁移、预热备用容量或使用流量切换。
+- **PDB（PodDisruptionBudget，Pod 中断预算）**保护的是 drain、维护等通过 eviction API 发起的自愿中断；它不能阻止 Deployment 按自己的滚动策略替换 Pod，也不能抵御节点宕机。因此发布可用性主要看 Deployment 的 `maxUnavailable` 和 readiness，PDB 是额外保护而不是万能开关。
+- 需要给 `/drain`、checkpoint 和终止过程监控：draining Run 数、剩余最长执行时间、被强杀数、恢复成功率、重复副作用数。超过发布窗口应自动暂停 rollout，而不是无限等。
+
+面试回答：**K8s 负责先起新副本、摘旧流量、给旧 Pod 优雅退出时间；Agent 自己负责 Run 的持久状态、lease、checkpoint 和幂等恢复。两者缺一个，长任务都可能在发布或故障时丢失或重复执行。**
+
+#### 28. 在 K8s 部署推理服务，健康检查怎么设计？
+
+推理服务不能只做 `GET /health == 200`。进程端口活着时，模型可能仍在加载、权重损坏、GPU 未分配、显存耗尽、队列已经爆满，或者推理线程死锁。应该把 **启动完成、是否接流量、进程是否需要重启、容量是否饱和** 分成不同信号。
+
+```text
+启动阶段：镜像 -> 权重 / tokenizer -> CUDA / 引擎 -> 模型加载
+                  | startup probe
+                  v
+可服务阶段：模型可用 + GPU / KV Cache 有余量 + 队列未过载
+                  | readiness probe
+                  v
+运行阶段：主事件循环 / worker 仍有进展，进程没有卡死
+                  | liveness probe
+                  v
+容量阶段：GPU 利用率、显存、队列、inflight、TTFT / P99
+                  | 指标告警与扩缩容，不应靠 liveness 重启解决
+```
+
+| 检查 | 它回答的问题 | 合理检查内容 | 不要这样做 |
+| --- | --- | --- | --- |
+| `startupProbe`（启动探针） | 模型服务是否已完成一次性初始化？ | 权重 / tokenizer 已加载、推理引擎初始化成功、必要 GPU device 可见。 | 用过短 liveness 在大模型加载时反复杀掉 Pod。 |
+| `readinessProbe`（就绪探针） | 这个实例现在能否安全接新请求？ | 模型已 ready、关键依赖可用、没有 drain、队列 / 并发 / KV Cache 未过载。 | 只要 TCP 端口通就接流量；或每 5 秒跑一次昂贵完整生成。 |
+| `livenessProbe`（存活探针） | 进程是否卡死到应该重启？ | 主 loop heartbeat、线程池进展、内部死锁检测；失败阈值要容忍短暂 GC / GPU 抖动。 | 因下游短暂慢、队列满或单个请求超时就重启整个模型。 |
+| 外部合成探测 + 指标 | 用户实际是否拿到正确且及时的推理？ | 小流量固定 prompt、错误率、TTFT（首 token 时间）、端到端 P99、GPU / 显存 / 队列。 | 把容量不足误判为“进程死了”，造成重启风暴。 |
+
+一个简化的 Probe 配置如下；数值必须来自模型大小、冷启动 p99 和压测，下面只展示职责划分：
+
+```yaml
+containers:
+- name: inference
+  startupProbe:
+    httpGet: {path: /health/startup, port: 8080}
+    periodSeconds: 5
+    failureThreshold: 120 # 最长约 10 分钟，覆盖模型加载窗口
+  readinessProbe:
+    httpGet: {path: /health/ready, port: 8080}
+    periodSeconds: 5
+    failureThreshold: 2
+  livenessProbe:
+    httpGet: {path: /health/live, port: 8080}
+    periodSeconds: 10
+    failureThreshold: 3
+```
+
+`/health/ready` 最好返回结构化原因，例如 `model_not_loaded`、`draining`、`queue_over_limit`、`gpu_unavailable`，便于 Events、日志与自动化决策。GPU 驱动错误、Xid、节点温度和设备分配等通常还要从 Device Plugin / Node 监控采集；Kubernetes 探针只看到容器内进程，不能代替节点和 GPU 监控。
+
+**和发布结合起来看**：新推理 Pod 只有 startup 和 readiness 成功才进入 Service；旧 Pod 收到 drain 后 readiness 立即失败、停止收新请求，剩余请求在终止宽限期内完成或按幂等键重试。若 readiness 因“过载”失败，要有上游排队、限流、扩容或降级，不要让所有实例同时被摘流量造成雪崩。
+
+更多 Agent 长任务的 checkpoint、死循环与运行治理见 [Agent_场景题_面经合集.md](../ai-tools/Agent_场景题_面经合集.md)。
+
 ---
 
 ## 八、最近公开面经里，大厂常问哪些 Docker / K8s / etcd 点？
@@ -1466,6 +1559,10 @@ CI 中以 Dockerfile / BuildKit 等构建不可变镜像，做依赖缓存、多
    https://kubernetes.io/docs/concepts/storage/persistent-volumes/
 18. etcd Disaster Recovery（快照、恢复与 quorum）  
    https://etcd.io/docs/v3.7/op-guide/recovery/
+19. Kubernetes Rolling Update（`maxUnavailable` / `maxSurge`）  
+   https://kubernetes.io/docs/tasks/run-application/update-deployment-rolling/
+20. Kubernetes Disruptions（PDB、优雅终止与滚动更新边界）  
+   https://kubernetes.io/docs/concepts/workloads/pods/disruptions/
 
 ### 公开面经 / 公开讨论（牛客为主）
 
