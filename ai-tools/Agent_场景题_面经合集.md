@@ -862,23 +862,144 @@ Codex 的官方 Code Review 支持按基准分支、未提交改动、指定提�
 
 ---
 
-## 11. Agent 网关和常规后端网关有什么相同与不同？MCP / A2A、模型路由、成本、审计应该放哪里？
+## 11. 从 Nginx / Kong 到 New API / Sub2API，再到 Agent Gateway：它们是什么关系？
 
-### 一、先把三个容易混淆的名字分开
+### 一、先看总图：三层不是互相替代，而是可以叠加
 
-“AI 中转站”“LLM Gateway（模型网关）”和“Agent Gateway（Agent 网关）”常被混用，但能力范围并不相同：
+~~~text
+外部用户、前端、SDK、Codex / Claude Code 等客户端
+                         │
+                         ▼
+┌──────────── 传统后端网关 ────────────┐
+│ Nginx / Kong / Envoy                 │
+│ TLS、WAF、登录鉴权、API 限流、路由     │
+└──────────────────┬──────────────────┘
+                   │
+                   ├──────── 普通后端 API ───────► 订单、用户、支付等服务
+                   │
+                   ▼
+┌──────────── AI 中转 / 模型网关 ───────┐
+│ New API / Sub2API / LiteLLM 等         │
+│ 协议兼容、渠道或账号、模型路由、额度账单 │
+└──────────────────┬──────────────────┘
+                   ▼
+          OpenAI / Claude / Gemini / 本地模型等
+
+若请求是 Agent：
+Agent Runtime（上下文、计划、Run 状态）
+                   │
+                   ▼
+┌──────────── Agent Gateway ───────────┐
+│ 模型调用 + MCP 工具 + A2A Agent 的策略 │
+│ 最小权限、审批、预算、审计、端到端 Trace │
+└──────────────────────────────────────┘
+~~~
+
+传统网关主要保护“谁能访问哪一个业务 API”；AI 中转主要处理“怎样稳定、统一、可计费地调用模型”；Agent Gateway 则进一步处理“Agent 能否调用什么工具、委托谁、读取什么数据、发生副作用前谁批准”。后两层常部署在传统网关后面，**不是用 New API 或 Sub2API 替换 Nginx / Kong。**
+
+### 二、常规后端网关：Nginx、Kong、Envoy 各适合什么？
+
+| 中间件 | 核心特点 | 常见场景 | 不适合单独承担什么 |
+| --- | --- | --- | --- |
+| Nginx | 高性能 Web Server 和反向代理；擅长 TLS 终止、静态资源、反向代理、缓存、基础负载均衡和连接治理。 | 单体或少量服务的入口、静态资源/CDN 回源、简单反向代理、已有 Nginx 运维体系的业务。 | 多团队 API 产品管理、复杂消费者/套餐治理、模型 token 成本、工具权限。 |
+| Kong | 面向 API 管理的平台型网关；在代理转发外，强调插件、消费者身份、认证授权、限流、版本/路由、可观测性与控制面管理。 | 微服务或开放平台：许多 API、多个调用方、统一 OAuth/API Key、灰度、限流策略与审计。 | Agent 的规划、上下文记忆和业务工作流；这些仍属于上层应用。 |
+| Envoy | 高性能可编程 L4/L7 代理，常用于 Kubernetes、服务网格和大规模东西向流量。 | K8s Ingress、Service Mesh、gRPC、细粒度流量治理、金丝雀和 mTLS。 | 面向业务用户的模型账单、渠道账号管理；需在其上再构建控制面。 |
+
+面试里不要只说“它们都是反向代理”。Nginx 更像**高性能、成熟的流量入口**；Kong 更像**把 API 当产品治理的网关平台**；Envoy 更像**云原生流量数据平面**。三者都可以做反向代理、鉴权、限流、超时、重试、熔断、访问日志和 Trace 透传，只是管理模型和典型部署位置不同。
+
+~~~text
+浏览器 / App
+    │ HTTPS
+    ▼
+Nginx / Kong
+    ├─ 验证 JWT、按 IP / 用户限流
+    ├─ 按 Host / Path 路由，例如 /api/order
+    ├─ 向上游复用连接、设置 timeout、记录 access log
+    ▼
+order-service -> Redis / MySQL / RPC
+~~~
+
+### 三、New API、Sub2API 这类“AI 中转站”到底做什么？
+
+它们本质上是**面向模型 API 的专用代理和运营控制台**：让调用方只接一个地址和一个 Key，再把请求转为上游模型或账号所需的协议，完成渠道选择、额度、统计和账务。它们的主链路仍然是“请求转发”，并不会自动获得 Agent 的计划、记忆或工具执行能力。
+
+~~~text
+业务服务 / Cursor / Codex CLI / 内部 SDK
+                 │  OpenAI / Claude / Gemini 兼容请求 + SSE 流式响应
+                 ▼
+      New API / Sub2API 等 AI 中转站
+      ├─ 验证下游 API Key、用户/分组/模型权限
+      ├─ 选择上游渠道、账号或模型并转协议
+      ├─ 并发 / 请求 / token 限流，失败切换
+      ├─ 记录 token 用量、成本、余额或配额
+      └─ 把流式响应转回给客户端
+                 │
+                 ▼
+      合法授权的模型供应商 API / 企业自建模型
+~~~
+
+| 对比项 | 常规后端网关 | AI 中转站 | Agent Gateway |
+| --- | --- | --- | --- |
+| 主要对象 | 业务 API 和上游服务实例。 | 模型供应商、模型渠道、账号 / API Key。 | 模型、MCP 工具、A2A Agent、长任务。 |
+| 路由依据 | Host、Path、服务健康度、权重。 | 模型名、协议格式、渠道余量、账号并发、价格/失败状态。 | 用户/租户、任务风险、数据域、工具能力、模型能力、审批状态。 |
+| 常见计量 | QPS、并发、状态码、带宽。 | input/output token、模型成本、余额、缓存命中、首 token 延迟。 | 每 Run 预算、工具次数、数据范围、人工审批、Task 状态和副作用。 |
+| 最大风险 | API 越权、流量打爆、上游故障。 | 密钥泄露、错误协议转换、供应商限额、账务不准、上游授权不合规。 | Prompt 注入诱导工具越权、敏感数据外发、错误副作用、跨 Agent 信任链断裂。 |
+
+#### New API：更偏“多模型统一接入 + 用量管理”
+
+[New API](https://github.com/QuantumNous/new-api) 将自己定位为面向合法授权场景的 AI API Gateway 与用量管理系统：统一模型接口与格式转换、渠道负载均衡/故障切换、令牌权限和模型访问控制、用量/成本统计、多租户与私有化部署。它适合个人、团队或企业把**已合法获得的上游 API Key 和模型服务**集中管理，向内部应用提供统一入口。
+
+需要注意两点：
+
+1. 它的 AGPLv3 许可证会影响企业二次开发和网络部署的合规评估，不能只看“开源免费”。
+2. 它仍主要是模型调用与资产管理层；高风险 MCP 工具的授权、审批和业务幂等性不能只靠它解决。
+
+#### Sub2API：更偏“订阅额度 / 多账号分发与计费”
+
+[Sub2API](https://github.com/YuHaiA/sub2api) 的项目说明将其定位为“分发和管理 AI 产品订阅额度”的 API Gateway：它可管理多种上游账号类型（OAuth、API Key），向下游生成 API Key，并处理账号调度、粘性会话、并发/速率控制、token 级计费、余额充值与管理后台。它适合有**合法授权的多账号、多用户额度分发**需求的平台化场景。
+
+但这类“订阅账号转 API”的模式必须额外强调：上游服务条款、账号授权范围、数据处理与当地监管要求可能限制转发、共享或转售。不能因为技术上能代理，就默认允许把个人订阅账号变成对外 API 服务；应优先使用供应商明确授权的 API、企业合同或自建模型，并保存可审计的授权依据。
+
+#### AI 中转和传统网关的关系
+
+最稳妥的部署通常是：
+
+~~~text
+公网用户 / 内部客户端
+       │
+       ▼
+Nginx / Kong：公网 TLS、WAF、统一身份、粗粒度限流
+       │
+       ▼
+New API / Sub2API：模型协议、渠道选择、token 配额、用量账单
+       │
+       ▼
+上游模型 API / 企业自建模型
+~~~
+
+也就是说，Nginx / Kong 仍可以放在最外层做边缘安全和通用 API 治理；New API / Sub2API 放在内层理解模型协议和 token 语义。若系统只有内部单一调用方，也可以合并部署，但职责仍应分开。
+
+#### 先按需求选层，不要一上来就堆三个网关
+
+| 你的真实问题 | 先考虑什么 |
+| --- | --- |
+| 对外暴露普通后端 API，需要 TLS、鉴权、限流和路由 | Nginx；多团队/开放平台/API 生命周期治理则评估 Kong。 |
+| 内部多个系统要调用多家模型，但都使用合法的供应商 API Key | New API、LiteLLM 等模型网关；重点验协议兼容、权限、成本和私有化。 |
+| 需要管理多账号、下游 Key、配额/计费和粘性调度 | Sub2API 类平台；上线前先确认每个上游账号的授权和服务条款。 |
+| Agent 要读数据、写业务、调用 MCP 或委托外部 Agent | 在模型中转之上增加 Agent Gateway / Tool Gateway；业务侧保留审批、幂等与状态机。 |
+
+### 四、什么才算 Agent Gateway？它和前两层是什么关系？
+
+“AI 中转站”“LLM Gateway（模型网关）”和“Agent Gateway（Agent 网关）”常被混用，但能力范围不同。行业没有严格统一命名；实务上，LLM 中转通常是 Agent Gateway 的**模型调用子平面**，而 Agent Gateway 还要治理工具和任务。
 
 | 名称 | 主要转发什么 | 能解决什么 | 不能天然解决什么 |
 | --- | --- | --- | --- |
-| 常规 API Gateway（API 网关） | 客户端到业务 API 的 HTTP / gRPC 流量。 | 认证、TLS、限流、路由、负载均衡、超时、WAF、日志。 | 不理解 token、模型、工具调用或 Agent 任务语义。 |
 | LLM Gateway / AI Relay（模型网关 / AI 中转） | 应用到多个模型供应商的推理请求。 | 统一 API、模型切换、密钥托管、token 用量/成本、流式代理、模型级限流与回退。 | 通常只管“调用模型”，不等于能治理工具、长任务和多 Agent 协作。 |
 | Agent Gateway（Agent 网关） | 除模型请求外，还治理 Agent 到工具、MCP Server、远端 Agent 的调用。 | 协议适配、工具发现/准入、细粒度授权、审批、跨 Agent 路由、端到端审计。 | 不应替代 Agent Runtime 的计划、记忆、业务状态机和最终业务判断。 |
 
-这些名称并没有统一的行业边界。实务上可以这样理解：**LLM Gateway 往往是 Agent Gateway 中的“模型调用子平面”；当网关还能理解 MCP 工具和 A2A 任务、并对它们做统一策略与观测时，才更接近完整的 Agent Gateway。**
-
 MCP（Model Context Protocol，模型上下文协议）是 AI 应用连接外部数据源、工具和工作流的开放标准；它解决“Agent 怎样使用工具”。A2A（Agent2Agent，代理到代理协议）则让独立 Agent 通过能力声明、任务和流式更新协作；它解决“Agent 怎样委托另一个 Agent 完成任务”。[MCP 官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro) [A2A 官方规范](https://a2a-protocol.org/v0.3.0/specification/)
 
-### 二、架构上放在哪里？
+### 五、Agent Gateway 架构上放在哪里？
 
 不要让网关直接承担 Agent loop。Agent Runtime 仍负责会话、上下文、规划、任务状态和业务验收；网关是它对外访问模型、工具和其他 Agent 时的**策略执行点**。
 
@@ -907,7 +1028,7 @@ Agent Runtime：Session / Context / Plan / Agent loop / Run 状态
 
 对于刚起步、只有一个模型和两三个只读工具的小系统，不必急着拆出独立 Agent Gateway；可以先把策略作为 Agent 服务内的模块。出现多团队、多模型、多租户、第三方 MCP、跨 Agent、合规审计或成本归因后，再独立出来，避免每个业务团队各自保存供应商密钥、各写一份重试和日志。
 
-### 三、和常规网关复用什么？又额外新增什么？
+### 六、和常规网关复用什么？又额外新增什么？
 
 | 能力 | 常规 API 网关已有的做法 | Agent 网关新增的语义 |
 | --- | --- | --- |
@@ -918,7 +1039,7 @@ Agent Runtime：Session / Context / Plan / Agent loop / Run 状态
 | 安全 | TLS、WAF、请求大小、密钥管理。 | Prompt 注入、工具参数校验、数据最小化、PII/Secret 脱敏、输出 DLP、人工审批。 |
 | 可观测性 | access log、状态码、延迟、Trace。 | 记录模型/版本、prompt 模板版本、token、成本、路由/回退原因、工具参数摘要、审批和策略命中；Trace 要贯穿一次 Run。 |
 
-### 四、MCP 与 A2A 的协议适配，具体要做什么？
+### 七、MCP 与 A2A 的协议适配，具体要做什么？
 
 #### MCP：把“工具能力”接进来，但不把权限一起放开
 
@@ -943,7 +1064,7 @@ A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。�
 
 注意边界：**网关可以代理和审计 A2A Task，但任务到底怎样规划、何时算成功、如何补偿，仍应由编排 Agent 或业务工作流负责。**
 
-### 五、模型、成本、敏感数据与 Trace：四个容易被问的设计点
+### 八、模型、成本、敏感数据与 Trace：四个容易被问的设计点
 
 #### 1. 模型 / 工具路由不是“谁便宜就用谁”
 
@@ -985,7 +1106,7 @@ A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。�
 
 审计记录的是“可追责的事实”，而不是无限保存原文：主体身份、资源、策略版本、允许/拒绝、耗时、错误、成本和数据分类应可查；原始内容按最小化、脱敏、短 TTL 和严格访问控制处理。
 
-### 六、常见方案怎么选？不要只背品牌
+### 九、平台化补充方案怎么选？不要只背品牌
 
 以下是截至当前常被用于 AI / Agent 网关的代表性方案；能力、许可与托管范围会随版本变化，选型前应以各自官方文档和 PoC 为准。
 
@@ -998,13 +1119,13 @@ A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。�
 
 例如 LiteLLM 官方把 Proxy 定位为多模型的集中式 LLM Gateway，并提供认证/授权、虚拟 Key、项目预算、日志与限流；Kong 当前将 LLM、MCP、A2A 作为可统一治理的三类流量；Portkey 文档列出了统一 API、MCP、路由/回退、熔断、预算和 token 限流等能力。[LiteLLM 文档](https://docs.litellm.ai/) [Kong 文档](https://developer.konghq.com/ai-gateway/) [Portkey 文档](https://portkey.ai/docs/product/ai-gateway)
 
-### 七、面试可直接答
+### 十、面试可直接答
 
 > 常规 API 网关解决的是北南向 API 流量治理：认证、TLS、限流、路由、超时和 Trace。Agent 网关会复用这些能力，但还要理解模型、工具和任务语义：模型侧按任务、质量、成本和配额路由；MCP 侧按用户和风险暴露工具、校验参数、发短期凭证并审计；A2A 侧验证 Agent Card、管理 Task 的流式状态和身份传递。  
 >
 > 我不会让网关替代 Agent Runtime。Runtime 负责上下文、计划和业务状态；网关负责策略执行和统一观测。最关键的是把每个 Run 的用户、租户、模型、token、成本、工具调用、审批和最终业务写入串成一条 Trace。这样出了问题才能回答：谁让 Agent 做的、它调了什么、为什么被允许、花了多少钱、是否有副作用。  
 >
-> 选型上，多模型内部平台可从 LiteLLM 这类 LLM Gateway 开始；已有 Kong API 平台且需要治理 MCP/A2A 时可评估 Kong AI Gateway；需要较完整的多模型路由、Guardrails 与观测可评估 Portkey。无论选哪个，工具的真实权限仍要落在 Tool Gateway / 后端 API，不能只靠模型提示词或网关转发。
+> 选型上，普通业务入口先看 Nginx 或 Kong；合法授权的多模型内部入口可用 New API 或 LiteLLM；需要多账号额度分发时才评估 Sub2API，并先确认上游授权。只有 Agent 真正需要工具、敏感数据和跨 Agent 协作时，才把 MCP/A2A、审批和 Run 审计加到 Agent Gateway。无论选哪个，工具的真实权限仍要落在 Tool Gateway / 后端 API，不能只靠模型提示词或网关转发。
 
 ## 参考资料
 
@@ -1014,6 +1135,8 @@ A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。�
 - [MCP：官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro)
 - [A2A：官方规范](https://a2a-protocol.org/v0.3.0/specification/)
 - [OpenAI：数据控制与远端 MCP](https://developers.openai.com/api/docs/guides/your-data)
+- [New API：项目说明](https://github.com/QuantumNous/new-api)
+- [Sub2API：项目说明](https://github.com/YuHaiA/sub2api)
 - [LiteLLM Proxy](https://docs.litellm.ai/)
 - [Kong AI Gateway](https://developer.konghq.com/ai-gateway/)
 - [Portkey AI Gateway](https://portkey.ai/docs/product/ai-gateway)
