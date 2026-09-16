@@ -8,7 +8,7 @@
 - `java/`：Java 集合、并发、JVM、Spring 基础
 - `database/`：MySQL、Redis
 - `middleware/`：Kafka、RabbitMQ / MQ、gRPC、etcd、Docker、K8s、Elasticsearch
-- `fundamentals/`：Linux、操作系统、计算机网络
+- `fundamentals/`：Linux、操作系统、计算机网络、Git、设计模式
 - `system-design/`：系统设计、场景题、稳定性与故障隔离
 - `algorithm/`：算法题整理
 - `ai-tools/`：AI 工具链相关

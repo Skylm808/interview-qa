@@ -860,8 +860,160 @@ Codex 的官方 Code Review 支持按基准分支、未提交改动、指定提�
 
 **面试加分点：**可以主动补一句“我会检查测试本身是否真的能抓到错误”。例如先故意移除关键校验、改错边界条件，确认新增测试会失败；这比只看覆盖率更能说明测试有判别力。
 
+---
+
+## 11. Agent 网关和常规后端网关有什么相同与不同？MCP / A2A、模型路由、成本、审计应该放哪里？
+
+### 一、先把三个容易混淆的名字分开
+
+“AI 中转站”“LLM Gateway（模型网关）”和“Agent Gateway（Agent 网关）”常被混用，但能力范围并不相同：
+
+| 名称 | 主要转发什么 | 能解决什么 | 不能天然解决什么 |
+| --- | --- | --- | --- |
+| 常规 API Gateway（API 网关） | 客户端到业务 API 的 HTTP / gRPC 流量。 | 认证、TLS、限流、路由、负载均衡、超时、WAF、日志。 | 不理解 token、模型、工具调用或 Agent 任务语义。 |
+| LLM Gateway / AI Relay（模型网关 / AI 中转） | 应用到多个模型供应商的推理请求。 | 统一 API、模型切换、密钥托管、token 用量/成本、流式代理、模型级限流与回退。 | 通常只管“调用模型”，不等于能治理工具、长任务和多 Agent 协作。 |
+| Agent Gateway（Agent 网关） | 除模型请求外，还治理 Agent 到工具、MCP Server、远端 Agent 的调用。 | 协议适配、工具发现/准入、细粒度授权、审批、跨 Agent 路由、端到端审计。 | 不应替代 Agent Runtime 的计划、记忆、业务状态机和最终业务判断。 |
+
+这些名称并没有统一的行业边界。实务上可以这样理解：**LLM Gateway 往往是 Agent Gateway 中的“模型调用子平面”；当网关还能理解 MCP 工具和 A2A 任务、并对它们做统一策略与观测时，才更接近完整的 Agent Gateway。**
+
+MCP（Model Context Protocol，模型上下文协议）是 AI 应用连接外部数据源、工具和工作流的开放标准；它解决“Agent 怎样使用工具”。A2A（Agent2Agent，代理到代理协议）则让独立 Agent 通过能力声明、任务和流式更新协作；它解决“Agent 怎样委托另一个 Agent 完成任务”。[MCP 官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro) [A2A 官方规范](https://a2a-protocol.org/v0.3.0/specification/)
+
+### 二、架构上放在哪里？
+
+不要让网关直接承担 Agent loop。Agent Runtime 仍负责会话、上下文、规划、任务状态和业务验收；网关是它对外访问模型、工具和其他 Agent 时的**策略执行点**。
+
+~~~text
+用户 / 前端
+    │
+    ▼
+常规 API Gateway：登录态、WAF、客户端限流、路由
+    │
+    ▼
+Agent Runtime：Session / Context / Plan / Agent loop / Run 状态
+    │
+    ▼
+┌────────────────── Agent Gateway 数据面 ──────────────────┐
+│ 身份映射、策略决策、协议适配、预算、审批、Trace、审计       │
+├──────────────┬───────────────────┬───────────────────────┤
+│ LLM 路由     │ MCP Tool Gateway  │ A2A Gateway           │
+│ 模型/供应商  │ 工具发现与调用    │ Agent Card/Task/流式  │
+└──────┬───────┴────────┬──────────┴──────────┬────────────┘
+       ▼                ▼                     ▼
+  模型供应商/本地模型   数据库、SaaS、内部 API    远端专业 Agent
+
+控制面：模型目录、MCP / Agent 注册、策略、密钥、配额、路由配置
+数据面：每一次真实请求的代理、鉴权、执行、记录和返回
+~~~
+
+对于刚起步、只有一个模型和两三个只读工具的小系统，不必急着拆出独立 Agent Gateway；可以先把策略作为 Agent 服务内的模块。出现多团队、多模型、多租户、第三方 MCP、跨 Agent、合规审计或成本归因后，再独立出来，避免每个业务团队各自保存供应商密钥、各写一份重试和日志。
+
+### 三、和常规网关复用什么？又额外新增什么？
+
+| 能力 | 常规 API 网关已有的做法 | Agent 网关新增的语义 |
+| --- | --- | --- |
+| 身份与权限 | OAuth / JWT、mTLS、RBAC、ACL。 | 把用户、租户、Agent、Run、工具和数据范围串起来；同一个用户不应因“让 Agent 调用”而获得更高权限。 |
+| 路由与负载均衡 | 按 Host、Path、权重、实例健康度转发。 | 按任务类型、模态、上下文长度、区域、质量/SLO、成本和供应商配额选择模型或 Agent。 |
+| 限流与配额 | 按 IP、用户、路由限制 QPS/并发。 | 按 input/output token、模型请求、并发 Run、工具调用次数、每租户成本限制；还要区分实时聊天和后台长任务。 |
+| 超时、重试、熔断 | 请求 deadline、退避、上游健康检查。 | 处理流式响应、用户取消、长任务状态；模型回退会改变输出质量，工具重试可能产生副作用，不能透明无脑重试。 |
+| 安全 | TLS、WAF、请求大小、密钥管理。 | Prompt 注入、工具参数校验、数据最小化、PII/Secret 脱敏、输出 DLP、人工审批。 |
+| 可观测性 | access log、状态码、延迟、Trace。 | 记录模型/版本、prompt 模板版本、token、成本、路由/回退原因、工具参数摘要、审批和策略命中；Trace 要贯穿一次 Run。 |
+
+### 四、MCP 与 A2A 的协议适配，具体要做什么？
+
+#### MCP：把“工具能力”接进来，但不把权限一起放开
+
+MCP Server 可以暴露文件、数据库、企业 SaaS 或内部业务 API。网关的工作不是把所有工具列表无差别塞给模型，而是：
+
+1. **注册与发现**：维护允许接入的 MCP Server、版本、工具 schema、所有者、数据域与风险等级；可以把已有 REST / OpenAPI / RPC 包装成 schema 明确的工具。
+2. **工具最小暴露**：按当前用户、租户、任务和上下文，只给模型必要的工具；工具越多，模型选择成本、token 消耗和误调用概率越高。
+3. **授权与审批**：读企业知识库和执行转账不是同等级能力。网关须将用户身份换成短期、最小权限凭证；写操作、生产查询、删除、外发等高风险工具需要明确审批。
+4. **参数与结果治理**：参数做 JSON Schema 校验、路径/SQL/URL allowlist、大小限制和超时；返回结果按来源标记、截断、脱敏，防止把敏感全文或注入指令直接带回上下文。
+5. **可靠性与审计**：工具有独立 deadline、并发上限、幂等键和重试规则；记录是谁的哪个 Run 调了哪个工具、作用于什么资源、策略为什么允许或拒绝。
+
+OpenAI 的远端 MCP 接入同样支持限制允许的工具、提供授权信息以及要求审批；并且 MCP Server 是第三方服务，发给它的数据受其自身保留政策约束。[OpenAI MCP 工具参考](https://platform.openai.com/docs/api-reference/realtime) [OpenAI 数据控制说明](https://developers.openai.com/api/docs/guides/your-data)
+
+#### A2A：治理“委托任务”，而不只是转发一条 HTTP
+
+A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。长任务还会有 Task ID、状态、Artifact（产物）和 SSE（Server-Sent Events，服务端推送事件）流式进度。网关需要：
+
+1. 验证 Agent Card 的来源、版本、签名/信任域和声明能力，不能根据自然语言描述就信任一个外部 Agent。
+2. 按能力、数据域、区域、成本与健康度路由到合适的远端 Agent，并把调用方身份、租户、Trace 和 deadline 受控传递。
+3. 对 Task 生命周期做关联：提交、取消、流式断线重连、回调/Webhook 校验、重复投递与最终状态查询。
+4. 对跨 Agent 传递的文件、Artifact、链接和数据字段做大小限制、恶意内容扫描、脱敏与留存策略。
+
+注意边界：**网关可以代理和审计 A2A Task，但任务到底怎样规划、何时算成功、如何补偿，仍应由编排 Agent 或业务工作流负责。**
+
+### 五、模型、成本、敏感数据与 Trace：四个容易被问的设计点
+
+#### 1. 模型 / 工具路由不是“谁便宜就用谁”
+
+先建立模型目录：模型能力、输入模态、上下文上限、区域、价格、已评测任务、延迟和可用性。路由策略可按任务分层：
+
+~~~text
+简单分类 / 抽取       -> 小模型或规则
+普通问答 / RAG         -> 默认性价比模型
+复杂代码 / 推理        -> 高能力模型
+图片 / 音频            -> 对应多模态模型
+供应商 429 / 5xx       -> 同等能力备选模型或稍后重试
+~~~
+
+任何 fallback（回退）都要显式记录原模型、失败原因、备选模型和质量风险。不同模型的工具调用、结构化输出和安全能力不完全等价；“切到备模型”是可用性策略，不是语义正确性的证明。
+
+#### 2. 配额与成本要先预留、后结算
+
+一次 Agent Run 的成本不只有一次模型调用，还包括输入 token、输出 token、缓存、重试、工具调用、向量检索和可能的第三方费用。常见做法：
+
+- 请求进入时按模型价格和最大输出 token 估算上限，向用户/团队/项目的预算做 reserve（预留）。
+- 流式完成后以实际 usage 结算并释放未使用额度；流式输出不能无限生成，要有 max output token 和每 Run 总预算。
+- 对单用户、租户、Agent、模型、工具分别限制并发、RPS、token/minute、daily spend；超过软阈值可改用低成本模型或要求确认，硬阈值直接拒绝。
+
+#### 3. 敏感数据的最小化原则
+
+敏感数据不应因为“模型很好用”就全量转发。网关在请求前做数据分类、Secret/PII 检测、字段删除或令牌化；按区域和供应商策略选择可发送的模型端点；响应再做 DLP 检查。日志默认保存 hash、长度、分类结果和必要摘要，不保存完整 Prompt、工具输出或 Authorization 头。
+
+#### 4. Agent Trace 必须能还原“为什么做了这个动作”
+
+一次 Run 至少应有 run_id 和 trace_id，并关联：
+
+~~~text
+用户请求
+  -> Agent plan / model call（模型、版本、token、成本、延迟）
+  -> tool call（MCP Server、工具、参数摘要、审批、结果摘要）
+  -> delegated task（A2A Agent、Task ID、状态、Artifact）
+  -> 最终回答 / 业务写入
+~~~
+
+审计记录的是“可追责的事实”，而不是无限保存原文：主体身份、资源、策略版本、允许/拒绝、耗时、错误、成本和数据分类应可查；原始内容按最小化、脱敏、短 TTL 和严格访问控制处理。
+
+### 六、常见方案怎么选？不要只背品牌
+
+以下是截至当前常被用于 AI / Agent 网关的代表性方案；能力、许可与托管范围会随版本变化，选型前应以各自官方文档和 PoC 为准。
+
+| 方案 | 更像哪一类 | 适合场景 | 选型提醒 |
+| --- | --- | --- | --- |
+| [LiteLLM Proxy](https://docs.litellm.ai/) | 开源优先的 LLM Gateway。 | 企业内部统一模型入口：多家模型供应商、OpenAI 兼容 API、虚拟 Key、项目/团队预算、认证和用量观测。 | 它的强项是模型统一接入与成本治理；MCP/A2A 的工具/任务安全仍需自行补上或与其他网关组合。 |
+| [Kong AI Gateway](https://developer.konghq.com/ai-gateway/) | 基于成熟 API Gateway 扩展的 AI / Agent Gateway。 | 已经使用 Kong、Kubernetes、Ingress 或企业 API 平台；希望把 LLM、MCP、A2A 都放进统一的认证、ACL、策略和 OpenTelemetry 体系。 | 适合平台化治理；要分清自托管数据面、托管控制面和具体 AI 插件/版本的能力边界。 |
+| [Portkey AI Gateway](https://portkey.ai/docs/product/ai-gateway) | 多模型 AI Gateway，提供开源网关与平台能力。 | 希望快速接多供应商、路由/回退、Guardrails、缓存、用量成本、MCP 连接和可观测性的团队。 | 先验证本地化部署、数据留存、企业 SSO、模型/工具策略是否满足合规要求。 |
+| 自建轻量代理 | 团队自维护的 LLM / Tool Proxy。 | 单一云或内网模型、模型种类少、强数据隔离、规则很明确的场景。 | 先做认证、审计、限额、超时与流式取消；不要一开始自研复杂的多模型评分、跨 Agent 编排平台。 |
+
+例如 LiteLLM 官方把 Proxy 定位为多模型的集中式 LLM Gateway，并提供认证/授权、虚拟 Key、项目预算、日志与限流；Kong 当前将 LLM、MCP、A2A 作为可统一治理的三类流量；Portkey 文档列出了统一 API、MCP、路由/回退、熔断、预算和 token 限流等能力。[LiteLLM 文档](https://docs.litellm.ai/) [Kong 文档](https://developer.konghq.com/ai-gateway/) [Portkey 文档](https://portkey.ai/docs/product/ai-gateway)
+
+### 七、面试可直接答
+
+> 常规 API 网关解决的是北南向 API 流量治理：认证、TLS、限流、路由、超时和 Trace。Agent 网关会复用这些能力，但还要理解模型、工具和任务语义：模型侧按任务、质量、成本和配额路由；MCP 侧按用户和风险暴露工具、校验参数、发短期凭证并审计；A2A 侧验证 Agent Card、管理 Task 的流式状态和身份传递。  
+>
+> 我不会让网关替代 Agent Runtime。Runtime 负责上下文、计划和业务状态；网关负责策略执行和统一观测。最关键的是把每个 Run 的用户、租户、模型、token、成本、工具调用、审批和最终业务写入串成一条 Trace。这样出了问题才能回答：谁让 Agent 做的、它调了什么、为什么被允许、花了多少钱、是否有副作用。  
+>
+> 选型上，多模型内部平台可从 LiteLLM 这类 LLM Gateway 开始；已有 Kong API 平台且需要治理 MCP/A2A 时可评估 Kong AI Gateway；需要较完整的多模型路由、Guardrails 与观测可评估 Portkey。无论选哪个，工具的真实权限仍要落在 Tool Gateway / 后端 API，不能只靠模型提示词或网关转发。
+
 ## 参考资料
 
 - [OpenAI：Codex 代码审查（官方文档）](https://learn.chatgpt.com/zh-Hans/docs/code-review)
 - [OpenAI：A practical guide to building agents](https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/)
 - [OpenAI：Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/)
+- [MCP：官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro)
+- [A2A：官方规范](https://a2a-protocol.org/v0.3.0/specification/)
+- [OpenAI：数据控制与远端 MCP](https://developers.openai.com/api/docs/guides/your-data)
+- [LiteLLM Proxy](https://docs.litellm.ai/)
+- [Kong AI Gateway](https://developer.konghq.com/ai-gateway/)
+- [Portkey AI Gateway](https://portkey.ai/docs/product/ai-gateway)
