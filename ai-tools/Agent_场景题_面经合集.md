@@ -1127,12 +1127,413 @@ A2A Agent 会通过 Agent Card 声明身份、能力、端点和认证要求。�
 >
 > 选型上，普通业务入口先看 Nginx 或 Kong；合法授权的多模型内部入口可用 New API 或 LiteLLM；需要多账号额度分发时才评估 Sub2API，并先确认上游授权。只有 Agent 真正需要工具、敏感数据和跨 Agent 协作时，才把 MCP/A2A、审批和 Run 审计加到 Agent Gateway。无论选哪个，工具的真实权限仍要落在 Tool Gateway / 后端 API，不能只靠模型提示词或网关转发。
 
+---
+
+## 12. MCP 与传统 HTTP API 有什么区别？MCP 到底给大模型输入什么？
+
+### 一、先给总体结论：MCP 和 HTTP 不是同一层的替代品
+
+这题最容易犯的错误，是回答成“HTTP 是旧协议，MCP 是新协议”。更准确的关系是：
+
+```text
+HTTP / stdio：消息通过什么通道传输
+JSON-RPC：请求、响应和错误怎样封装
+MCP：AI 应用怎样发现和调用工具、读取资源、获取提示模板
+```
+
+远程 MCP 本身就可以运行在 HTTP 上，本地 MCP Server 也可以通过标准输入输出通信。因此真正应该比较的是：**MCP 与团队自己定义的 REST / HTTP 工具接口有什么差异。**
+
+```text
+传统自定义 HTTP API
+Client ── GET /orders/1001、POST /refund ──> Business Server
+每个接口自己约定 URL、参数、返回值、鉴权、文档和错误语义
+
+MCP
+Agent Host ── tools/list、tools/call、resources/read ──> MCP Server
+协议统一约定能力发现、JSON Schema、调用结果和内容类型
+底层仍然可以使用 HTTP
+```
+
+截至 MCP `2026-07-28` 规范，远程调用采用无状态核心：每个请求携带协议版本和所需元数据，可以由普通 HTTP 负载均衡后的任意实例处理。这进一步说明 MCP 是建立在 HTTP 基础设施之上的能力协议，而不是 HTTP 的替代品。[MCP 2026-07-28 发布说明](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
+
+### 二、传统 HTTP API 和 MCP 分别解决什么问题？
+
+| 对比维度 | 自定义 HTTP / REST API | MCP |
+| --- | --- | --- |
+| 核心目标 | 让两个确定的软件系统调用业务接口 | 让不同 AI Host 用统一方式发现并使用外部能力 |
+| 接口发现 | OpenAPI、接口文档、SDK 或人工约定 | 标准的 tools、resources、prompts 列举与读取接口 |
+| 参数描述 | 由每个 API 自己约定；可选 OpenAPI Schema | Tool 使用明确的 `inputSchema`，还可声明 `outputSchema` |
+| 调用语义 | `GET /orders/{id}`、`POST /refund` 等业务自定义 | `tools/call(name, arguments)`，工具名称和参数由协议承载 |
+| 返回内容 | 自定义 JSON、文件或状态码 | 标准 Content Block，可包含文本、图片、音频、资源链接和结构化结果 |
+| 对模型的适配 | 开发者手工把 API 描述转换成模型工具定义 | Host 从 MCP 发现能力，再转换成模型可用工具 |
+| Prompt / 上下文 | 不属于普通 REST API 的统一标准 | 原生定义 Resources 和 Prompts |
+| 权限和审批 | 由 API Gateway / 业务服务自行实现 | MCP 标准化能力表达，真实授权仍由 Host / Gateway / Server 实现 |
+| 传输 | HTTP | 可使用 Streamable HTTP；本地场景也可使用 stdio |
+
+MCP 的价值不是让一次 HTTP 请求更快，而是减少每个 Agent 工具都写一套“发现、schema、调用、结果适配”的胶水代码。如果一个接口只供固定后端服务调用，不需要让 Agent 动态发现，普通 HTTP / RPC 往往更直接。也可以保留已有 REST 服务，在外面增加一层薄 MCP Server：
+
+```text
+大模型 / Agent Host
+       │ MCP
+       ▼
+MCP Server：工具 schema、授权、参数校验、结果裁剪
+       │ HTTP / RPC
+       ▼
+已有订单、库存、工单、搜索服务
+```
+
+### 三、MCP Server 有哪三类核心能力？
+
+| 能力 | 谁决定使用 | 给模型或应用什么 | 例子 |
+| --- | --- | --- | --- |
+| Tools | 通常由模型选择，Host 最终执行和授权 | 能力名称、描述、输入/输出 Schema；调用后返回结果 | `get_order`、`refund_order`、`search_logs` |
+| Resources | 通常由 Host 或用户选择并加入上下文 | 带 URI、名称、MIME、正文或二进制内容的数据 | README、数据库 schema、工单正文、图片 |
+| Prompts | 通常由用户或 Host 选择模板 | 参数化后的一组消息或内容 | “按事故复盘格式分析告警” |
+
+工具适合“做动作或按需查询”，资源适合“提供上下文数据”，Prompt 适合“复用交互模板”。例如订单 MCP Server 可以声明一个工具：
+
+```json
+{
+  "name": "get_order",
+  "description": "根据订单号查询当前用户有权限查看的订单状态",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "order_id": {"type": "string", "description": "订单号"}
+    },
+    "required": ["order_id"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "status": {"type": "string"},
+      "updated_at": {"type": "string"}
+    },
+    "required": ["status"]
+  }
+}
+```
+
+这只是“能力说明”，不是已经查出的订单数据。模型决定调用后，Host 才向 MCP Server 发出 `tools/call`，Server 再查询真实业务系统并返回结果。
+
+### 四、MCP 究竟向大模型输入什么？
+
+严格来说，**不是 MCP Server 直接把所有东西塞给大模型，而是 MCP Host 在中间选择、裁剪和组装上下文。**
+
+```text
+MCP Server
+  ├─ tools/list：工具名称、描述、inputSchema、outputSchema、annotations
+  ├─ resources/read：资源正文 / 图片 / 二进制内容 / 元数据
+  ├─ prompts/get：展开后的消息模板
+  └─ tools/call：工具执行结果
+            │
+            ▼
+MCP Client（协议连接）
+            │
+            ▼
+Host / Agent Runtime
+  1. 按用户、任务和权限筛选工具
+  2. 选择需要加入上下文的资源或 Prompt
+  3. 截断、脱敏、标注来源
+  4. 转换成具体模型 API 的 messages / tools 格式
+            │
+            ▼
+           LLM
+```
+
+一次典型模型调用里，LLM 实际可能看到：
+
+```text
+1. System / developer instructions
+2. 用户问题：“订单 1001 为什么还没发货？”
+3. 可用工具定义：get_order(name、description、JSON Schema)
+4. 已选择的资源或历史 Tool Result
+```
+
+如果模型决定查询订单，完整闭环是：
+
+```text
+LLM 输出 tool call：get_order({"order_id":"1001"})
+        │
+        ▼
+Host 校验参数、用户权限和审批策略
+        │
+        ▼
+MCP Client -> MCP Server：tools/call
+        │
+        ▼
+MCP Server -> 订单 HTTP/RPC 服务 -> 返回结构化结果
+        │
+        ▼
+Host 截断 / 脱敏后，把 Tool Result 作为新一轮上下文交给 LLM
+        │
+        ▼
+LLM 生成自然语言答案
+```
+
+所以 MCP 给模型的主要是：
+
+- **调用前：**工具名称、用途描述和参数 Schema，让模型知道能做什么、参数怎么填。
+- **读取时：**被 Host 选中的资源内容或 Prompt 展开结果。
+- **调用后：**文本、结构化 JSON、图片、资源引用等 Tool Result，让模型基于真实结果继续推理。
+
+模型通常不应该看到 OAuth Token、数据库密码、协议元数据、其他 Server 的全部内容或未授权资源。完整会话和跨 Server 聚合应留在 Host，Server 只接收完成当前调用所必需的信息。[MCP 2026-07-28 Server 规范](https://modelcontextprotocol.io/specification/2026-07-28/server)
+
+### 五、工具描述会全部塞进 Context 吗？
+
+不一定，也不应该无脑全部塞入。
+
+- 工具很少时，Host 可以把允许使用的工具定义直接交给模型。
+- 工具很多时，应先按租户、用户权限、任务类型和风险过滤，再做语义检索或分组选择。
+- Resource 默认也不等于全部进 Context；通常先列出元数据，再按需读取。
+- Tool Result 要限制大小、分页、摘要并保留来源，不能把十万行 SQL 结果原样塞回模型。
+
+```text
+注册了 500 个工具
+  -> 当前用户有权限 80 个
+  -> 当前任务相关 8 个
+  -> 本轮实际向模型暴露 3 个
+```
+
+工具越多，token 成本、选错工具概率和提示词注入面都会增加。另外，Tool 的 `readOnlyHint`、`destructiveHint`、`idempotentHint` 等 annotations 只是提示，不能代替真实权限判断。来自不受信任 Server 的描述和 annotations 都应视为不可信输入。
+
+### 六、常见追问
+
+**🟢 追问 1：有了 MCP，还需要 HTTP API 吗？**
+
+需要。MCP Server 内部往往仍通过 HTTP / RPC 调用现有业务服务；MCP 解决 Agent 接入标准化，HTTP / RPC 继续承担真实业务通信。
+
+**🟡 追问 2：MCP Server 会直接访问大模型吗？**
+
+通常不会。Host 持有模型会话，MCP Server 提供工具、资源和 Prompt；Host 决定哪些内容进入上下文。某些扩展流程可以请求模型能力，但不能因此把 Server 理解成模型代理。
+
+**🟡 追问 3：工具的 description 算不算 Prompt？**
+
+它会影响模型选工具，可以看作上下文的一部分，但首先是协议里的工具元数据。它可能被恶意 Server 注入，因此必须筛选 Server、限制工具暴露，并在真实授权层校验。
+
+**🔴 追问 4：为什么不直接把 OpenAPI 文档交给模型？**
+
+小规模时可以，但 MCP 进一步统一了运行期能力发现、工具调用、资源、Prompt、内容块和结果返回。OpenAPI 更偏 HTTP API 描述；MCP 更贴近 Agent 的“发现—选择—调用—继续推理”闭环。二者也可以组合。
+
+### 面试里推荐这样答
+
+> MCP 和 HTTP 不是替代关系。HTTP 解决消息怎样传输，MCP 解决 AI Host 怎样用统一协议发现工具、读取资源、获取 Prompt 并调用能力；远程 MCP 本身就可以跑在 HTTP 上。MCP Server 主要暴露 Tools、Resources 和 Prompts，但不是把所有内容直接塞给模型。Host 会先按用户权限和当前任务筛选：调用前把工具名称、描述和 JSON Schema 转成模型工具定义；需要时把资源或 Prompt 加入上下文；工具执行后再把经过截断、脱敏的 Tool Result 交给模型继续推理。模型通常看不到认证密钥、完整协议握手和未授权资源，真正的权限与审批必须由 Host、Gateway 和业务服务强制执行。
+
+---
+
+## 13. 多 Agent 协作时任务重叠怎么办？需要上层仲裁协调者吗？
+
+### 一、先给总体抽象：把它当成并发分布式系统
+
+多 Agent 冲突不能只靠 Prompt 里写一句“不要重复工作”。正确思路是：
+
+```text
+事前：协调者拆任务、声明读写范围，尽量避免重叠
+事中：任务租约、版本号、fencing token，阻止过期 Agent 提交
+事后：验证器按规则和测试合并；语义冲突才交给仲裁者或人工
+```
+
+通常需要一个上层协调者，但它不一定是另一个“大模型领导”。更稳妥的架构是：
+
+```text
+                        ┌─> Agent A：查询 / 方案 / Patch A ─┐
+用户目标 -> Orchestrator├─> Agent B：查询 / 方案 / Patch B ─┼─> Verifier / Merge Queue
+          任务 DAG、租约 └─> Agent C：测试 / 风险检查 ──────┘          │
+                                                                         ▼
+                                                         唯一 Committer / Action Executor
+                                                                         │
+                                                                         ▼
+                                                              Git / DB / 外部业务系统
+```
+
+- **Orchestrator：**拆任务、维护依赖、分配所有权、超时重试，不负责凭感觉决定业务真相。
+- **Agent Worker：**读取输入，产出证据、方案或候选 Patch，默认不直接执行不可逆副作用。
+- **Verifier / Judge：**优先运行确定性测试、规则和约束；只有语义方案冲突时才使用 LLM 评审。
+- **Committer / Action Executor：**单一写入口，负责版本校验、幂等和最终提交。
+
+核心原则是：**可以有多个思考者，但同一个业务资源最好只有一个最终写入者。**
+
+### 二、先区分四种“重叠”
+
+| 重叠类型 | 例子 | 风险 | 处理方式 |
+| --- | --- | --- | --- |
+| 重复只读 | A、B 都查同一份日志 | 浪费成本，但通常不破坏状态 | 可去重或保留冗余做交叉验证 |
+| 相邻分析 | A 查 Redis，B 查数据库，都判断同一故障 | 结论可能冲突 | Verifier 按时间、新鲜度和事实源裁决 |
+| 同一代码写入 | A、B 同时修改同一函数 | Patch 覆盖、语义不一致 | 独立分支/worktree，测试后进 merge queue |
+| 同一业务副作用 | A、B 都给订单 1001 退款 | 可能重复退款或通知，最危险 | 幂等键、唯一约束、状态机和单一执行器 |
+
+重复读可以接受，甚至能提高结论可信度；重复写必须由系统机制阻止。不要为了完全不重叠，把所有并行能力都取消。
+
+### 三、协调者怎样在事前减少重叠？
+
+协调者先把目标拆成带边界的任务 DAG，而不是只发两句自然语言：
+
+```json
+{
+  "task_id": "T-102",
+  "goal": "修复订单重复创建",
+  "read_scope": ["order-service", "order schema"],
+  "write_scope": ["internal/order/idempotency.go"],
+  "resource_keys": ["repo:order-service:file:internal/order/idempotency.go"],
+  "depends_on": ["T-101"],
+  "input_version": "commit:abc123",
+  "lease_until": "2026-09-17T12:00:00Z",
+  "expected_output": "patch + tests + evidence"
+}
+```
+
+任务注册表至少记录：
+
+```text
+task_id, parent_task_id, status, owner_agent,
+read_scope, write_scope, resource_keys,
+input_version, lease_until, fencing_token,
+attempt, output_ref, validation_status
+```
+
+分配前检查 `resource_keys`：
+
+- 写范围完全不同，可以并行。
+- 一读一写可以并行，但读取方要绑定输入版本，版本变化后重新验证。
+- 两个任务都写同一资源，应合并、建立先后依赖，或明确一个只产方案、另一个负责实现。
+
+代码 Agent 不应共用同一工作区直接编辑；给每个 Agent 独立 branch / worktree，最终通过 merge queue 集成。业务 Agent 不应直接调用退款、发信或删除接口；先提交 Action Proposal，再由唯一执行器落地。
+
+### 四、如果 A、B 已经重复执行，怎样保证只生效一次？
+
+关键不是谁先回复协调者，而是业务写入必须具备幂等和并发控制。假设 A、B 都决定退款订单 `1001`：
+
+```text
+Agent A ─> Proposal(refund, order=1001, reason=duplicate)
+Agent B ─> Proposal(refund, order=1001, reason=duplicate)
+                         │
+                         ▼
+                  Action Executor
+     idempotency_key = refund:order:1001:duplicate
+                         │
+                ┌────────┴────────┐
+                ▼                 ▼
+           第一次插入成功       唯一键冲突
+           执行真实退款         返回已有结果
+```
+
+数据库唯一约束负责最终防重：
+
+```sql
+CREATE UNIQUE INDEX uk_agent_action
+ON agent_action(action_type, business_key, intent_version);
+```
+
+再用状态机或条件更新限制合法迁移：
+
+```sql
+UPDATE orders
+SET status = 'REFUNDING', version = version + 1
+WHERE order_id = 1001
+  AND status = 'PAID'
+  AND version = :expected_version;
+```
+
+只有影响行数为 1 的执行者获得提交权；另一个读取最新状态后结束，不得再次调用支付平台。
+
+长任务还要使用 lease 和 fencing token：
+
+```text
+协调者把 token=41 发给 Agent A
+A 超时后，任务转交 B，B 获得 token=42
+A 稍后恢复并提交 token=41
+执行器发现 41 < 当前 token 42，拒绝这个过期写入
+```
+
+单纯的分布式锁不够：Agent A 可能在锁过期后继续运行。fencing token 能让最终资源服务识别并拒绝旧 owner。
+
+### 五、真的冲突时，谁来仲裁？
+
+仲裁顺序应该从确定性最强的证据开始：
+
+```text
+1. 权限、安全策略、业务不变量
+2. 数据库状态机、版本号、唯一约束
+3. 编译、测试、静态检查、评测集
+4. 证据完整性、数据时间和事实源优先级
+5. LLM Judge 对语义方案做比较或综合
+6. 高风险或仍不确定：人工审批
+```
+
+例如 A 建议“直接重试退款”，B 建议“先查支付状态”：支付状态机规定未知结果不能再次退款，那么策略规则已经可以否决 A，不需要再让第三个模型投票。
+
+LLM 仲裁者适合比较设计方案、总结证据、合并非确定性文本，不适合替代唯一约束、权限系统和测试。否则会出现“三个 Agent 都很自信，但一起把钱退了两次”。
+
+代码 Patch 的仲裁可以这样做：
+
+```text
+Patch A ─┐
+         ├─> 在相同 base commit 上应用
+Patch B ─┘       │
+                 ├─ 有文本冲突：标记 conflict，重新规划
+                 ├─ 无文本冲突：合并候选
+                 └─ build + test + lint + security checks
+                              │
+                       全部通过才提交
+```
+
+Git 能自动 merge 不等于逻辑正确；无文本冲突但共同破坏业务语义时，要靠集成测试和不变量检查发现。
+
+### 六、协调者会不会成为单点瓶颈？
+
+- Orchestrator 实例无状态化，任务 DAG、租约和版本写入数据库；
+- 用条件更新竞争任务所有权，而不是靠单机内存锁；
+- Agent 心跳续租，超时后任务可重新分配；
+- Committer 可以按业务 key 分片，但同一 key 始终进入同一串行提交路径；
+- 每次 Proposal、审批、执行和补偿记录 `run_id / task_id / action_id`。
+
+协调者宕机只应暂停新调度，不应让已完成的副作用丢失或重复。外部调用要带幂等键，数据库事务里用 Outbox 可靠发布后续事件。
+
+### 七、冲突已经造成副作用怎么办？
+
+1. 暂停该 `business_key` 的后续写入和自动重试。
+2. 查询事实源，确认哪些动作真正提交，不能只看 Agent 自述。
+3. 保留合法动作，用幂等记录废弃重复 Proposal。
+4. 已发生的重复外部副作用通过冲正、撤销、恢复库存等业务补偿处理。
+5. 记录两个 task 的输入版本、lease、tool call 和策略决策，修正任务拆分或资源 key。
+
+```text
+Agent 输出了建议        -> 可以丢弃或重新生成
+代码 Patch 尚未合并     -> 可以重新应用和测试
+数据库事务已经提交      -> 需要状态机和补偿
+外部支付 / 邮件已发生   -> 只能依赖幂等或业务撤销能力
+```
+
+### 八、常见追问
+
+**🟢 追问 1：是不是所有多 Agent 系统都需要一个 LLM Manager？**
+
+不需要。简单并行检索用任务队列和代码规则就够了。只有任务需要动态拆分、语义综合时才让模型参与规划；租约、幂等、权限和提交仍由确定性系统实现。
+
+**🟡 追问 2：A、B 做同一份分析是不是一定要取消一个？**
+
+不一定。只读分析可以作为冗余验证，但要控制成本。若目标是覆盖不同视角，应明确给 A、B 不同假设或数据源。
+
+**🟡 追问 3：有分布式锁为什么还要 fencing token？**
+
+锁可能过期，而旧 Agent 不知道自己已失去所有权。fencing token 由最终写入方比较新旧版本，能拒绝迟到的旧 owner。
+
+**🔴 追问 4：两个 Agent 的答案都通过测试，怎么选？**
+
+先比较需求覆盖、风险、复杂度、性能和可维护性；允许时合并互补部分。若影响生产数据、安全或资金且证据不足，应交给人工，而不是用多数投票制造确定性。
+
+### 面试里推荐这样答
+
+> 多 Agent 协作本质上是并发分布式系统问题。上层通常需要 Orchestrator 维护任务 DAG、读写范围、租约和依赖，但它不一定是另一个 LLM；确定性的调度器和状态机更可靠。事前按资源 key 拆任务，代码 Agent 使用独立 branch/worktree，业务 Agent 默认只产出 Proposal；事中用 lease、版本号和 fencing token 拒绝过期提交；最终由单一 Committer 或 Action Executor 用幂等键、唯一约束和状态机保证副作用只发生一次。冲突时先看权限和业务不变量，再看测试与事实证据，只有语义取舍才交给 LLM Judge，高风险仍由人工审批。这样允许多个 Agent 并行思考，但不会让它们并行破坏同一份业务状态。
+
 ## 参考资料
 
 - [OpenAI：Codex 代码审查（官方文档）](https://learn.chatgpt.com/zh-Hans/docs/code-review)
 - [OpenAI：A practical guide to building agents](https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/)
 - [OpenAI：Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/)
 - [MCP：官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro)
+- [MCP：2026-07-28 规范发布说明](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
+- [MCP：2026-07-28 Schema Reference](https://modelcontextprotocol.io/specification/2026-07-28/schema)
 - [A2A：官方规范](https://a2a-protocol.org/v0.3.0/specification/)
 - [OpenAI：数据控制与远端 MCP](https://developers.openai.com/api/docs/guides/your-data)
 - [New API：项目说明](https://github.com/QuantumNous/new-api)
