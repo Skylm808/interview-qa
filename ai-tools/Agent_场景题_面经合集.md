@@ -2478,6 +2478,167 @@ Subagent 返回的也不应只是自然语言“完成了”，而应包含：
 
 > Codex 的多 Agent 不是多个模型共享同一块“脑内内存”，而是主线程委派多个独立 agent thread，子 Agent 返回摘要、证据和 Artifact，主 Agent 负责等待、追加要求、审查和整合。代码并行写入时，默认最好采用并行读、单写者；确实要并行写就按模块切分，并为不同聊天使用独立 Git worktree，最后由一个集成者合并和跑测试。Worktree 只能隔离文件视图，不能防语义冲突，更不能保证重复退款等业务原子性；业务写操作仍需单一 Action Executor、幂等键、唯一约束、状态机/CAS 和 fencing token。上下文方面，Codex 用 Thread、Turn 和 Item 持久化会话，可 resume 或 fork，长历史通过 compaction 形成较小的模型可见上下文。Memory 是跨会话的可选辅助召回，不是完整历史，也不是强制规则或共享数据库；必须遵守的规则放 `AGENTS.md`，真实状态放 Git、测试、数据库或受权限保护的外部系统。
 
+---
+
+## 18. Code Review Agent 如何控制 Token、切换模型并支持断点续跑？
+
+### 一、总体抽象：不要把一次 CR 设计成一次不可恢复的大模型请求
+
+> 我会把 PR 按文件、函数和语义完整的 diff chunk 拆成可持久化任务，为整个 Review 设置 Token/金额/时间预算。每个 chunk 独立执行，完成后立即保存 checkpoint、finding、token usage 和模型版本。主模型限流、超时或预算不足时，由 Model Router 对剩余 chunk 降级或切换模型；Worker 重启后只恢复未完成部分，最后统一合并、去重和验证 Findings。
+
+记忆主线：
+
+```text
+Chunk → Budget → Checkpoint → Idempotency → Model Router
+```
+
+```text
+PR Diff
+   ↓
+Semantic Chunker：文件 → 函数 → diff chunk + 必要上下文
+   ↓
+Risk Scorer：安全/并发/事务优先
+   ↓
+Budget Controller ───────► Model Router
+   ↓                           │
+Chunk Worker          强模型 / 小模型 / Backup
+   ↓
+Checkpoint + Finding 持久化
+   ↓
+Merge / Dedupe / Evidence Validation
+   ↓
+Final Review Report
+```
+
+### 二、怎样切 Chunk？
+
+不能机械地每 5000 token 截断，因为一个缺少类型、调用方或错误处理分支的片段会让模型误判。推荐单位是：
+
+```text
+一个函数的 diff
++ 必要的类型和接口定义
++ 直接调用方/被调用方摘要
++ 仓库规则与相关测试
+```
+
+每个 chunk 保存 `content_hash` 和 `base_commit`。PR 更新后，hash 未变的成功 chunk 可以复用；变化的 chunk 及受影响依赖重新执行，避免缓存旧结论。
+
+### 三、Budget 怎样控制？
+
+预算不只是一条“最大 token”配置，而是调用前的准入判断：
+
+```text
+used + estimated_next > total_budget ?
+    ├── 否：按计划执行
+    └── 是：只审高风险 chunk / 缩小上下文 / 换小模型 / 等待人工加预算
+```
+
+可以分三层：
+
+| 层次 | 限制项 | 超限策略 |
+| --- | --- | --- |
+| 单次模型调用 | input/output token、timeout | 压缩上下文或拆小 chunk |
+| 单个 PR Run | 总 token、金额、wall time、调用次数 | 优先高风险代码，低风险降级/跳过并明确标记 |
+| 租户/团队 | 分钟/日配额、并发 Run 数 | 排队、限流、优先级和预算审批 |
+
+安全、权限、并发、事务和数据迁移等高风险代码优先使用强模型；文档、格式和简单样板可用小模型。降级必须在报告中保留 `model/reason/coverage`，不能假装所有文件都经过同等强度审查。
+
+### 四、Checkpoint 存什么？怎样恢复？
+
+```text
+review_task
+task_id | repo | base_commit | head_commit | status
+total_chunks | completed_chunks | token_used | token_budget
+
+review_chunk
+task_id | chunk_id | content_hash | status | attempt
+model | token_used | lease_owner | lease_until | last_error
+
+finding
+task_id | chunk_id | rule_id | file | line | evidence_hash | severity
+```
+
+状态机：
+
+```text
+PENDING → RUNNING → SUCCESS
+              ├──► RETRY_WAIT → RUNNING
+              ├──► FAILED
+              └──► CANCELLED
+```
+
+恢复流程：
+
+```text
+Worker 重启
+   ↓
+读取 task + chunks
+   ↓
+SUCCESS 且 content_hash 未变化：跳过
+RUNNING 但 lease 已过期：重新抢占
+PENDING / 可重试 FAILED：继续执行
+   ↓
+重新 Merge 已保存 Findings
+```
+
+`task_id + chunk_id + content_hash` 可作为幂等依据；状态更新用版本号/CAS，Worker 使用 lease 和 fencing token，避免旧 Worker 超时后回来覆盖新结果。Finding 也应有稳定指纹，防止重复执行生成两条相同评论。
+
+### 五、模型切换为什么不能“续上上一个模型的脑内状态”？
+
+模型切换时真正可靠的交接物必须是显式状态：
+
+```text
+任务目标 + base/head commit + chunk 内容
++ 仓库规则 + 已验证事实 + 工具结果/Artifact
++ 剩余预算 + 已保存 Findings + 未完成项
+```
+
+不能依赖上一个模型的隐藏推理或未持久化上下文。Model Router 在 429、超时、供应商故障或预算压力下选择替代模型前，还要验证：
+
+- 上下文窗口和结构化输出是否兼容；
+- Tool/Skill 能力是否一致；
+- 安全和数据区域策略是否允许；
+- 质量是否通过同一套 Code Review Eval；
+- 当前 chunk 是否已经产生结果未知的副作用。
+
+### 六、Checkpoint 存 SQLite 还是 MySQL/PostgreSQL？
+
+技术选型取决于部署形态：
+
+| 场景 | 选择 | 原因 |
+| --- | --- | --- |
+| 本地 CLI、Demo、单机单 Worker | SQLite | 一个文件、支持事务和 SQL、无需额外服务，开箱即用 |
+| 多 Worker、多副本、高并发生产服务 | MySQL/PostgreSQL | 更适合网络访问、并发写、HA、备份和统一运维 |
+| 大量异步任务 | DB + MQ | DB 保存事实状态，MQ 负责唤醒和分发；MQ 消息不是唯一状态源 |
+
+SQLite 不是“性能一定更好”，而是单机阶段复杂度最低。Store 层应先抽象接口，数据模型保留稳定 task/chunk/finding 语义；演进到分布式时替换存储，并补充原子抢占、lease、唯一约束和迁移方案。
+
+### 七、失败、取消和观测
+
+- 429、网络抖动和超时采用有总预算的退避重试；无效认证、Schema 不兼容等永久错误直接失败；
+- 用户取消后停止创建新调用，并把 cancellation 传到模型、Sandbox 和子任务；
+- Finding 每完成一个 chunk 就落库，不等整个 PR 结束才保存；
+- 记录 task/chunk 成功率、恢复次数、重复执行率、token/金额、模型降级率和不同模型的缺陷命中率；
+- 最终报告明确覆盖范围、跳过文件、失败 chunk 和使用的模型，不能“部分成功却报告全量完成”。
+
+### 八、常见追问
+
+**🟢 追问 1：为什么不能把整个 PR 一次性交给大模型？**
+
+上下文可能放不下，失败会全量重跑，成本和恢复粒度都不可控；超大上下文还会稀释相关证据。语义分片可以并行、缓存和独立重试。
+
+**🟡 追问 2：切换便宜模型后怎样保证质量？**
+
+按代码风险分层，低风险才降级；替代模型必须通过相同评测，报告记录模型和覆盖强度。高风险 chunk 宁可排队或人工审查，也不能静默降级。
+
+**🔴 追问 3：模型超时，不知道是否已产生结果怎么办？**
+
+把一次 attempt 记录为结果未知，先查询供应商/任务状态；无法确认时可用同一 attempt/key 重试，并依靠 chunk 和 Finding 指纹去重。若工具产生外部副作用，还必须由工具端保证幂等，不能只靠 Agent 状态。
+
+### 面试里推荐这样答
+
+> 生产级 Code Review Agent 应是有状态的分片任务系统，而不是一次大模型请求。我会按文件、函数和语义完整性切 chunk，以 task/chunk/content hash 保证幂等；Controller 为 PR 维护 token、金额、时长预算，高风险代码使用强模型，低风险代码可降级。每个 chunk 完成就持久化 checkpoint、finding、模型和 token usage，故障后跳过未变化的 SUCCESS chunk，只恢复 PENDING、失败或租约过期任务。模型切换依赖显式 Task State 和 Artifact，不依赖隐藏上下文。单机阶段可用 SQLite 降低部署复杂度，多 Worker 生产环境迁移到 MySQL/PostgreSQL，并用 MQ 分发、DB 保存事实状态，最后对 Findings 去重验证并明确报告覆盖范围。
+
 ## 参考资料
 
 - [OpenAI：Codex 代码审查（官方文档）](https://learn.chatgpt.com/zh-Hans/docs/code-review)
