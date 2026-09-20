@@ -2135,11 +2135,360 @@ Guardrail 是概率性或前置检查，可能被绕过、误判或版本漂移�
 
 > 企业级 Agent 框架本质是可控执行平台，不只是封装一次 LLM 调用。底层要有可替换的模型网关和契约化 Tool/MCP 平台；运行时要把 Agent loop 做成持久化 Run 状态机，支持 checkpoint、取消、预算、幂等重试和补偿；Context、RAG、Memory 必须带 ACL、来源、版本和生命周期。安全上身份、短期凭证、参数级授权、沙箱和审批都在模型之外强制执行，业务后端再次保证不变量。平台还要用 Run Trace 串起模型、检索、工具、审批和最终动作，并把评测、版本、canary、回滚、多租户配额和成本归因作为一等能力。实现上优先用确定性 Workflow 固定高风险骨架，只在动态判断处使用 Agent，先把单 Agent 做可靠，再按职责和权限需要演进到多 Agent。
 
+---
+
+## 17. Codex 多 Agent 通信、写冲突治理、会话上下文与 Memory 专栏
+
+> 本节依据 OpenAI 官方 Codex Subagents、Git worktrees、App Server、Memories 和模型上下文文档整理。先强调一个容易被讲错的边界：**Codex 能提供 Agent 线程、任务编排、工作区隔离、审批与 Git 合并基础设施，但它不会自动替业务系统解决重复退款、重复扣库存等并发一致性问题。**
+
+### 一、先给总体抽象：四层各管一件事
+
+```text
+                        ┌─────────────────────────┐
+                        │ 主 Agent / 协调者        │
+                        │ 拆任务、等待、验收、整合  │
+                        └────────────┬────────────┘
+                                     │ task / follow-up / result
+                  ┌──────────────────┼──────────────────┐
+                  ▼                  ▼                  ▼
+             Agent A Thread     Agent B Thread     Agent C Thread
+              查代码/写模块       跑测试/写模块       查资料/审查
+                  │                  │                  │
+                  └──────────────┬───┴──────────────────┘
+                                 ▼
+                     Artifact / Diff / Summary / Evidence
+                                 │
+                                 ▼
+                      主 Agent 统一验收和提交
+
+代码冲突边界：Worktree + 文件所有权 + Git merge + tests
+业务冲突边界：幂等键 + 唯一约束 + 状态机/CAS + fencing token
+```
+
+可以把官方机制分成四层：
+
+| 层次 | Codex 中的机制 | 解决什么 | 不能解决什么 |
+| --- | --- | --- | --- |
+| 协调层 | 主 Agent、Subagent、独立 agent thread、任务/结果消息 | 并行调查、委派和汇总 | 不能仅凭 Prompt 保证两个写操作互斥 |
+| 工作区层 | 独立 Git worktree、diff、分支/提交、测试 | 避免多个任务直接覆盖同一份工作目录 | Git 只能发现部分文本冲突，发现不了所有语义冲突 |
+| 执行治理层 | sandbox、工具权限、写操作审批、操作事件 | 限制 Agent 能调用什么、让高风险动作可审查 | 审批不等于数据库事务或业务幂等 |
+| 业务一致性层 | 需要业务自己实现 | 幂等、并发控制、资源不变量 | Codex 不会自动替应用补上这一层 |
+
+官方 Subagents 文档也建议优先把并行 Agent 用在探索、测试、分诊和总结等偏读任务；写密集型任务要谨慎，因为协调成本和代码冲突都会上升。[OpenAI：Codex Subagents](https://developers.openai.com/zh-Hans/docs/agent-configuration/subagents)
+
+### 二、Codex 中多个 Agent 是怎样通信和管理的？
+
+#### 1. 不是“几个模型共用一段脑内记忆”，而是一棵 Agent Thread 树
+
+主 Agent 接受用户目标后，把边界清晰的子任务发送给 Subagent。每个 Subagent 在自己的 **agent thread** 中运行，有自己的对话和工具执行过程；完成后把结论、证据、改动或失败原因返回主线程。主 Agent 再综合这些结果，而不是让所有 Agent 同时随意改同一处状态。
+
+```text
+Root Thread（用户目标和最终责任）
+├── Agent Thread A：定位认证代码，只读调查
+├── Agent Thread B：检查测试覆盖，只读调查
+└── Agent Thread C：在指定模块实现变更
+        └── C1：复核并发边界
+
+通信方向：父任务说明  ───────► 子 Agent
+          子结果/证据 ◄─────── 子 Agent
+控制动作：追加要求、等待、打断、关闭
+```
+
+Codex App Server 把协作动作表示成可观察的 item/event；其中 `collabToolCall` 会记录发送线程、接收线程或新线程、任务提示和 Agent 状态。也就是说，工程上可以追踪“谁委派给谁、现在是什么状态”，而不是靠聊天文本猜测。[OpenAI：Codex App Server](https://developers.openai.com/zh-Hans/docs/app-server)
+
+一次可靠委派应至少包含以下任务契约：
+
+```yaml
+goal: 修复订单取消时重复退款
+base_revision: 8f32c1a
+read_scope: [order/, payment/, related tests]
+write_scope: [order/cancel.go, order/cancel_test.go]
+do_not_touch: [payment/provider.go, database migrations]
+constraints: 不改变现有 API；所有外部调用必须有 context timeout
+acceptance: 指定测试通过；重复请求只产生一次退款
+return: 改动摘要、文件列表、测试证据、残余风险
+```
+
+任务描述越像一个可验收合同，主 Agent 越容易判断结果是否可合并。只说“你去处理支付”会使多个 Agent 的工作范围重叠。
+
+#### 2. 主 Agent 是协调者，但不是自动万能的分布式锁
+
+主 Agent 负责拆分职责、控制并发、追加要求、等待结果、审查 diff 和决定最终提交。它可以采用“单写者”策略，但如果两个 Agent 已经直接访问同一个外部系统，单靠上层口头协调仍可能发生竞态。
+
+```text
+协调可以减少冲突：          强一致性必须由执行端保证：
+
+Agent A 说“我要退款”          INSERT action_id（唯一键）
+Agent B 说“我也要退款”   +    UPDATE ... WHERE version = 7
+主 Agent 尽量只选一个          状态机校验 PAID -> REFUNDING
+                              = 即使两个请求同时到达也只成功一个
+```
+
+因此更准确的回答是：**上层确实有主 Agent/协调者，但协调者负责计划和整合；真正的写冲突防线必须下沉到 Git、工具执行器和业务数据库。**
+
+### 三、多个 Agent 写代码时，Codex 怎样降低冲突？
+
+#### 1. 三种策略按可靠性排序
+
+**策略 A：一个任务只有一个写者，其他 Agent 只读。**
+
+这是最稳妥的默认方式。A、B 并行调查，主 Agent 汇总结论后，让 C 统一修改：
+
+```text
+A：分析调用链 ──┐
+                 ├──► 主 Agent 形成方案 ──► C：唯一写者 ──► tests
+B：寻找测试缺口 ─┘
+```
+
+**策略 B：按不重叠的所有权切分。**
+
+例如 A 只改 `api/`，B 只改 `docs/`，主 Agent 验证接口约定。边界要写进任务契约，公共接口文件仍由一个人负责。
+
+**策略 C：独立 worktree 并行改，再统一合并。**
+
+Codex 的 Git worktree 为不同聊天提供独立 checkout；每个工作树共享 Git 对象，但有自己的文件视图，适合并行试验而不互相覆盖。Git 规定同一分支不能同时检出到多个 worktree，Codex 管理的 worktree 通常也与单个聊天绑定。[OpenAI：Codex Git worktrees](https://developers.openai.com/zh-Hans/docs/environments/git-worktrees)
+
+```text
+同一个 Git Repository
+├── worktree-agent-a/  -> feature/api-change   -> commit A
+├── worktree-agent-b/  -> feature/cache-test   -> commit B
+└── integration/       -> cherry-pick/merge -> build/test/review -> main
+```
+
+Worktree 解决的是“文件视图互不覆盖”，并不保证改动一定兼容。两个 Agent 即使修改不同文件，也可能分别改变同一接口的两端，形成 **语义冲突**。所以最终仍要：
+
+1. 明确基线 commit、文件/模块所有权和接口契约；
+2. 每个 Agent 返回 commit/diff，而不是声称“已经搞定”；
+3. 在集成工作树执行 merge/cherry-pick；
+4. 跑单测、集成测试、静态检查，并人工审查高风险逻辑；
+5. 只有一个集成者把验证后的结果推到目标分支。
+
+> 注意：同一目录中的 Subagent 可能看到共享文件系统。不要把“有独立 agent thread”误解为“天然有独立 worktree”；需要隔离写入时，应明确使用独立 worktree，或者直接采用单写者。
+
+### 四、两个 Agent 同时执行业务写操作，怎样真正做到不冲突？
+
+#### 1. 推荐模式：Agent 只提案，单一执行器提交
+
+```text
+Agent A 调查订单 ──► Proposal A ──┐
+                                   ├──► Policy/Approval
+Agent B 调查支付 ──► Proposal B ──┘          │
+                                              ▼
+                                      Single Action Executor
+                                              │
+                         idempotency_key + expected_version + fencing_token
+                                              │
+                                              ▼
+                                     业务服务 / Database
+```
+
+各 Agent 可以并行做判断，但不直接持有生产写凭证。Action Executor 校验身份、策略、资源版本和审批摘要后才写入。这是架构建议，不是 Codex 自动替业务创建的组件。
+
+#### 2. 百万请求也只能退款一次的完整例子
+
+假设订单 `O1001` 当前为 `PAID, version=7`。A 和 B 都认为应该退款：
+
+```text
+稳定动作 ID：refund:O1001:v7
+
+事务内：
+1. INSERT INTO agent_action(action_id, status)
+   VALUES ('refund:O1001:v7', 'STARTED');
+   -- action_id 有 UNIQUE 约束，第二个执行者在这里失败或读取已有结果
+
+2. UPDATE orders
+   SET status='REFUNDING', version=8
+   WHERE id='O1001' AND status='PAID' AND version=7;
+   -- affected_rows 必须等于 1，否则状态已变化，拒绝继续
+
+3. 通过 outbox 可靠地产生退款命令；支付侧仍按同一幂等键去重
+```
+
+需要组合的机制：
+
+| 机制 | 防什么问题 |
+| --- | --- |
+| 稳定 `action_id` / idempotency key | 重试、重复委派、超时后未知结果导致重复执行 |
+| 数据库唯一约束 | 两个执行者同时抢同一个动作 |
+| 状态机 + expected version/CAS | 基于旧状态做决定、并发覆盖 |
+| lease + fencing token | 旧 worker 租约过期后又回来提交 |
+| Outbox/Inbox | 数据库状态与消息发送不一致、消息重复消费 |
+| Approval 绑定参数摘要 | 审批之后偷偷更改对象、金额或工具参数 |
+| 执行后查询验证 | 工具超时但其实已成功，Agent误判并重试 |
+
+Prompt 中写“不要重复退款”只是一条软约束；唯一键、CAS 和状态机才是硬约束。Git worktree 更与生产订单原子性无关。
+
+### 五、Codex 的会话、Thread 和 Context 到底是什么关系？
+
+#### 1. 从外到内看四个概念
+
+```text
+Session / 会话树
+└── Thread / 一条可恢复或可分叉的工作线
+    ├── Turn / 一次用户输入到 Agent 完成
+    │   ├── Item：消息
+    │   ├── Item：命令/文件变更/工具调用
+    │   └── Item：协作、审批、计划等事件
+    └── Compaction Item：较早历史的压缩表示
+
+模型某次真正看到的 Context
+= 系统/开发者规则 + AGENTS.md + 当前任务
+  + 选取或压缩后的 Thread 历史
+  + 相关文件/工具结果 + 可能启用的 Memory
+```
+
+App Server 提供 `thread/start`、`thread/resume` 和 `thread/fork`：
+
+- `resume`：继续原来的工作线；
+- `fork`：保留已有历史，派生一条新的工作线，适合尝试不同方案；
+- `thread/read`、turn/item 列表：读取持久化的会话结构；
+- `thread/inject_items`：把 Responses API item 持久地注入模型可见历史，但不立即启动新一轮；
+- `thread.sessionId`：标识会话树根，分叉线程仍可保留同一根 session 标识。
+
+这说明“保存了完整 Thread”与“每次都把完整 Thread 原文送进模型”不是一回事。前者是可恢复的持久化记录，后者受上下文窗口和相关性预算约束。
+
+#### 2. 长会话怎样避免 Context 无限增长？
+
+Codex harness 负责跨轮维护上下文、工具调用、进度、失败和审批；当历史过长时可以进行 **context compaction**。App Server 会产生 `contextCompaction` item，后续请求使用较小的压缩表示继续工作。[OpenAI：Codex as a platform](https://developers.openai.com/blog/codex-as-a-platform) [OpenAI：模型上下文与 compaction](https://developers.openai.com/api/docs/guides/latest-model)
+
+```text
+早期 1~50 轮原始历史 ──► 压缩为 Compaction Item ──┐
+                                                    ├──► 下一轮 Context
+最近几轮 + 当前文件 + 工具输出 ────────────────────┘
+```
+
+压缩的目标是保留任务所需状态，不保证逐字保留每个细节。因此：
+
+- 已确认的接口、决策和 TODO 应写进仓库文档或任务文件；
+- 代码真实状态以 Git、文件、测试为准，不能只依赖会话摘要；
+- 工具长输出应保存 Artifact，Context 中只放摘要和引用；
+- 工作真正分叉时使用 fork，不要在同一线程里混入多个不相关目标；
+- `/compact` 适合长任务续航，`/resume` 适合回到已有任务。
+
+### 六、Agent Memory 是什么？它和 Context 有什么区别？
+
+最常见的误解是把 Memory 理解成“模型永久记住了所有聊天”。更准确的分层如下：
+
+| 类型 | 生命周期 | 适合放什么 | 是否是可靠事实源 |
+| --- | --- | --- | --- |
+| 当前 Context | 单次推理 | 当前目标、近期消息、相关代码和工具结果 | 有窗口限制，可能被压缩 |
+| Thread 历史 | 一条会话/分叉树 | turns、items、工具事件、审批和 compaction | 可恢复记录，但不一定全部进入每次 Context |
+| Codex local memories | 跨会话、可配置 | 稳定偏好、常用约定、历史工作提示 | 是辅助召回，不应独自承载强制规则 |
+| `AGENTS.md` | 仓库/目录范围、版本化 | 必须遵守的命令、边界和团队规范 | 确定性规则来源之一 |
+| Skill | 可复用 | 稳定流程、领域知识、脚本和模板 | 可审阅、可版本化的操作手册 |
+| Repo/DB/MCP | 外部真实状态 | 代码、测试、工单、实时数据 | 应作为最终事实源并做权限校验 |
+
+官方 Memories 文档说明：本地 Codex 客户端的 memory store 与 ChatGPT 网页端 Memory 分开；符合条件的历史聊天可在后台生成本地 memory 文件，后续任务按需使用。它是可选能力，当前文档中本地 Memory 默认关闭，可通过 `/memories` 和配置项控制“是否使用”与“是否从本次聊天生成”。[OpenAI：Codex Memories](https://developers.openai.com/zh-Hans/docs/customization/memories)
+
+```text
+历史聊天
+   │  后台提取（可能跳过短会话/活跃会话，并清理生成字段中的秘密）
+   ▼
+~/.codex/memories/ 中的本地记忆
+   │  后续任务按需召回
+   ▼
+Context Builder ──► 本轮模型 Context
+```
+
+关键边界：
+
+1. **Memory 不是完整聊天录像。** 它是提取和整合后的辅助信息，可能遗漏或过期。
+2. **Memory 不是团队强制规范。** 必须执行的规则应写入版本化的 `AGENTS.md`、代码、测试或策略系统。
+3. **Memory 不是共享数据库。** 不要假设新 Subagent 自动知道父 Agent 的所有经历；父 Agent 应明确传入任务契约和必要证据。
+4. **Memory 不该存秘密。** 即使生成过程会清理秘密，也应避免把 Token、密码、私钥和生产个人数据写入聊天或长期记忆，并在共享前复核。
+5. **外部数据要谨慎生成 Memory。** 官方配置支持在存在外部上下文时禁用记忆生成，避免把网页、MCP 或工具结果错误沉淀为长期偏好。
+
+### 七、多 Agent 的 Context 怎样传递最稳？
+
+不要复制主线程全部历史。应传递“最小且可验证”的上下文包：
+
+```json
+{
+  "task_id": "cancel-refund-42",
+  "parent_thread": "root",
+  "base_revision": "8f32c1a",
+  "goal": "确认重复退款根因并给出修复证据",
+  "inputs": ["order/cancel.go", "trace-20260920.json"],
+  "facts": ["订单 O1001 的 provider_refund_id 已存在"],
+  "assumptions": ["支付供应商按 idempotency_key 去重，待验证"],
+  "write_scope": [],
+  "acceptance": ["给出调用链", "区分已证实事实和推测"],
+  "return_schema": ["summary", "evidence", "risks", "recommended_patch"]
+}
+```
+
+Subagent 返回的也不应只是自然语言“完成了”，而应包含：
+
+```text
+结论 + 证据位置 + 改动 diff/commit + 实际执行的测试
++ 未验证假设 + 失败项 + 建议下一步
+```
+
+这相当于把 Agent 间通信从“随意聊天”升级为带输入版本和验收条件的协议。共享事实最终落到文件、Git commit、Artifact、工单或数据库；Thread summary 用于导航，不承担唯一事实源职责。
+
+### 八、一个从并行调查到安全提交的完整案例
+
+任务：修复“订单取消接口偶发重复退款”。
+
+```text
+1. Root 固定 base commit，并声明生产系统只读
+2. A 读取订单调用链；B 读取支付幂等实现；两者都不写代码
+3. Root 汇总证据，确定根因是超时后无查询直接重试
+4. C 在独立 worktree 修改订单状态机与测试
+5. Reviewer Agent 只读检查 diff、并发边界和测试缺口
+6. Root 在集成工作树合并，跑 race/unit/integration tests
+7. 人工批准部署；部署工具绑定 commit SHA、环境和变更摘要
+8. 线上 Action Executor 仍使用 action_id、CAS 和支付侧幂等键
+9. Root 查询退款单和审计日志，验证后才宣布完成
+```
+
+这里每层的职责非常清楚：
+
+- Agent thread 让调查和审查并行；
+- worktree 防止代码目录相互覆盖；
+- Git 和测试验证改动能否集成；
+- sandbox/approval 控制谁能执行部署；
+- 业务状态机、唯一键和幂等键保证“最多产生一次退款”；
+- Artifact 和外部系统记录提供跨会话可核查事实；
+- Memory 只帮助下次想起项目偏好，不参与退款一致性判断。
+
+### 九、常见追问
+
+**🟢 追问 1：Subagent 是否能看到主 Agent 的所有上下文？**
+
+不能把它当作默认保证。Subagent 有独立 agent thread，父 Agent 会通过任务提示和平台提供的上下文委派工作。可靠做法是显式给出目标、输入、基线版本、读写范围和验收条件，而不是依赖“它应该知道”。
+
+**🟡 追问 2：有 worktree 后能否放心让十个 Agent 同时写？**
+
+不能。Worktree 只隔离文件视图；并行度越高，接口漂移、重复实现和语义冲突越多。先并行读，写任务优先单写者；确实可拆时按模块所有权切分，并由单一集成者合并和测试。
+
+**🟡 追问 3：主 Agent 能不能充当分布式锁？**
+
+它可以调度“谁先做”，但不能成为唯一正确性边界。消息可能重试、执行可能超时、旧 Worker 可能迟到。真正的并发安全要由执行器和资源服务通过幂等键、唯一约束、CAS、租约和 fencing token 保证。
+
+**🔴 追问 4：Compaction 会不会丢信息？**
+
+它会用更紧凑的表示保留继续任务所需的状态，而不是保证逐字重放全部历史。关键决策、接口契约、原始证据和待办要写入可版本化 Artifact；恢复后还应重新读取当前代码和外部状态。
+
+**🔴 追问 5：Memory、RAG 和 `AGENTS.md` 如何选择？**
+
+个人或项目的辅助偏好用 Memory；动态企业知识用带 ACL、来源和时效的 RAG/MCP；必须遵守的仓库规则用 `AGENTS.md`；可复用操作流程用 Skill。不要用 Memory 代替权限系统、业务数据库或测试。
+
+### 面试里推荐这样答
+
+> Codex 的多 Agent 不是多个模型共享同一块“脑内内存”，而是主线程委派多个独立 agent thread，子 Agent 返回摘要、证据和 Artifact，主 Agent 负责等待、追加要求、审查和整合。代码并行写入时，默认最好采用并行读、单写者；确实要并行写就按模块切分，并为不同聊天使用独立 Git worktree，最后由一个集成者合并和跑测试。Worktree 只能隔离文件视图，不能防语义冲突，更不能保证重复退款等业务原子性；业务写操作仍需单一 Action Executor、幂等键、唯一约束、状态机/CAS 和 fencing token。上下文方面，Codex 用 Thread、Turn 和 Item 持久化会话，可 resume 或 fork，长历史通过 compaction 形成较小的模型可见上下文。Memory 是跨会话的可选辅助召回，不是完整历史，也不是强制规则或共享数据库；必须遵守的规则放 `AGENTS.md`，真实状态放 Git、测试、数据库或受权限保护的外部系统。
+
 ## 参考资料
 
 - [OpenAI：Codex 代码审查（官方文档）](https://learn.chatgpt.com/zh-Hans/docs/code-review)
 - [OpenAI：A practical guide to building agents](https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/)
 - [OpenAI：Unrolling the Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/)
+- [OpenAI：Codex Subagents](https://developers.openai.com/zh-Hans/docs/agent-configuration/subagents)
+- [OpenAI：Codex Git worktrees](https://developers.openai.com/zh-Hans/docs/environments/git-worktrees)
+- [OpenAI：Codex App Server](https://developers.openai.com/zh-Hans/docs/app-server)
+- [OpenAI：Codex Memories](https://developers.openai.com/zh-Hans/docs/customization/memories)
+- [OpenAI：Codex as a platform](https://developers.openai.com/blog/codex-as-a-platform)
+- [OpenAI：模型上下文与 compaction](https://developers.openai.com/api/docs/guides/latest-model)
 - [MCP：官方介绍](https://modelcontextprotocol.io/docs/getting-started/intro)
 - [MCP：2026-07-28 规范发布说明](https://blog.modelcontextprotocol.io/posts/2026-07-28/)
 - [MCP：2026-07-28 Schema Reference](https://modelcontextprotocol.io/specification/2026-07-28/schema)
