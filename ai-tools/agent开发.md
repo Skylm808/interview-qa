@@ -145,7 +145,53 @@ Context → Model decision → Action / Tool Call → Observation → State upda
 
 ---
 
-## 3. Workflow、ReAct、Plan-and-Execute 放在 L1：都是控制流模式
+## 3. Workflow 和 ReAct 是同一层吗？
+
+### 先说结论：宏观上同属 L1，具体实现上不是同一抽象粒度
+
+在前面的六层架构中，Workflow 和 ReAct 都回答“下一步做什么”，所以都可以放进 **L1 决策与编排层**进行比较：
+
+```text
+任务执行策略
+├── Workflow：开发者预先定义步骤、分支和关卡
+├── ReAct：模型根据 Observation 动态选择下一步
+└── Plan-and-Execute：模型先生成计划，再逐步执行和调整
+```
+
+但从具体系统实现看，它们通常不是平级组件：
+
+> **Workflow 决定整个业务流程的外层骨架；ReAct 决定某个 Agent 节点内部如何动态思考、调用工具和继续行动。**
+
+```text
+用户目标
+   │
+   ▼
+┌───────────────────────────────┐
+│ Workflow / 状态机 / DAG        │  外层业务编排
+│                               │
+│ 参数校验 → Agent 分析 → 审批   │
+│               │        → 执行 │
+└───────────────┼───────────────┘
+                │ 某个 Agent 节点内部
+                ▼
+┌───────────────────────────────┐
+│ ReAct Agent Loop              │  内层动态决策
+│                               │
+│ Reason → Action → Observation │
+│    ▲                    │      │
+│    └────────────────────┘      │
+└───────────────────────────────┘
+```
+
+所以要区分两个观察尺度：
+
+| 观察尺度 | Workflow 和 ReAct 的关系 | 为什么 |
+| --- | --- | --- |
+| 架构地图 | 可以放在同一层比较 | 都属于 L1 的任务控制方式，都在决定下一步 |
+| 运行时实现 | 通常是外层与内层关系 | Workflow 编排完整业务，ReAct 常是其中一个 Agent 节点的执行循环 |
+| 控制流理论 | ReAct 也可视为一种循环型 Workflow | 循环骨架固定，但每轮的具体动作由模型动态选择 |
+
+### L1 中常见的控制流模式
 
 | 模式 | L1 中谁决定下一步 | 适用场景 | 风险/治理点 |
 | --- | --- | --- | --- |
@@ -158,15 +204,133 @@ Context → Model decision → Action / Tool Call → Observation → State upda
 | Generator–Critic | 生成者和验证者 | 代码、报告、结构化产物 | 验收要独立且可运行 |
 | Multi-Agent | Manager 或 handoff | 权限/工具/专业性不同，或子任务真能并行 | 明确输入输出契约、隔离 Context、控制交接成本 |
 
-### Workflow 与 Agent 的区别
+### Workflow 与 ReAct 的核心区别
 
 ```text
 Workflow（代码定路径）：查订单 → 硬规则校验 → 人确认 → 退款 → 对账
 
-Agent（模型定下一步）：订单号缺失则追问；政策不明则检索；证据不足则转人工
+ReAct（模型定下一步）：订单号缺失则追问；政策不明则检索；证据不足则转人工
 ```
 
-生产常用组合：**外层 Workflow 固定高风险骨架，内层 ReAct 处理检索、诊断和解释。**Anthropic 将前者定义为预定义代码路径，后者定义为 LLM 动态管理过程与工具使用。[Anthropic：Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+| 对比项 | Workflow | ReAct |
+| --- | --- | --- |
+| 路径 | 运行前大体确定 | 运行时根据 Observation 动态产生 |
+| 下一步由谁决定 | 代码、DAG、规则或状态机 | LLM |
+| 可预测性 | 高 | 相对较低 |
+| 灵活性 | 适合已知流程 | 适合路径未知、需要边查边判断的问题 |
+| 状态恢复 | 可从确定的流程节点恢复 | 要保存 Action、Observation、预算和终止状态 |
+| 调用成本 | 相对稳定 | 轮数和工具次数可能波动 |
+| 高风险动作 | 容易插入硬规则、审批和补偿 | 不能只靠模型自觉，必须交回确定性关卡 |
+
+### 用一次线上故障说明二者怎样配合
+
+“处理订单服务告警”的完整流程适合由 Workflow 控制：
+
+```text
+接收告警
+   ↓
+确定性 Workflow 拉取基础证据
+   ↓
+ReAct Agent 动态分析根因
+   ↓
+生成候选处理方案
+   ↓
+Policy 检查 + 人工审批
+   ↓
+Action Executor 执行变更
+   ↓
+Workflow 验证 SLI 并决定结束或回滚
+```
+
+其中“动态分析根因”节点内部才运行 ReAct：
+
+```text
+Reason：先检查最近是否发生过发布
+Action：query_deployments(service="order")
+Observation：10 分钟前发布了 v2.3
+
+Reason：比较发布前后的错误率
+Action：query_metrics(metric="error_rate", version="v2.3")
+Observation：错误率从 0.1% 上升到 12%
+
+Reason：还需要异常日志才能确认原因
+Action：search_logs(service="order", version="v2.3")
+Observation：大量数据库连接获取超时
+
+Final：证据指向 v2.3 的连接池配置，建议回滚并提交审批
+```
+
+在这个例子中：
+
+- Workflow 保证“必须先取证、再审批、后执行、最后验证”；
+- ReAct 决定调查时先查发布、指标还是日志，路径不必提前写死；
+- ReAct 只能提出回滚建议，不能绕过 Policy、审批和 Action Executor；
+- 即使 ReAct 判断错误，外层的权限、审批、幂等和结果验证仍然有效。
+
+### ReAct 能不能算一种 Workflow？
+
+从广义控制流看，可以：
+
+```text
+Reason → Action → Observation
+   ▲                  │
+   └──────────────────┘
+```
+
+固定的是循环框架：思考、行动、观察，直到满足终止条件；动态的是具体调用哪个工具、调用几次、下一步调查什么。因此更严谨的说法是：
+
+> ReAct 是一种 **Agent Loop / 动态决策策略**；Workflow 是更广义的流程编排机制。ReAct 可以作为 Workflow 中的一个节点，也可以由 Workflow 引擎承载其循环，但两者不能直接画等号。
+
+### 企业系统的典型组合：确定性 Workflow 包住 ReAct
+
+```text
+┌────────────── 企业 Workflow ──────────────┐
+│                                          │
+│ 输入与身份校验                           │
+│       ↓                                  │
+│ ReAct Agent：检索、调查、生成候选方案      │
+│       ↓                                  │
+│ Policy：确定性权限和参数检查               │
+│       ↓                                  │
+│ Human Approval                           │
+│       ↓                                  │
+│ Action Executor：幂等执行                  │
+│       ↓                                  │
+│ Post-condition：确定性验证或补偿            │
+│                                          │
+└──────────────────────────────────────────┘
+```
+
+选择原则很简单：
+
+- 路径稳定、规则明确、风险高的步骤交给 Workflow；
+- 信息不完整、路径未知、需要语义判断的步骤交给 ReAct；
+- 涉及资金、库存、权限和生产变更时，让 ReAct 只调查和提案；
+- 最大轮数、超时、token/金额预算、工具白名单和停止条件由外层 Runtime 强制控制。
+
+生产常用的正是这种组合：**外层 Workflow 固定高风险骨架，内层 ReAct 处理检索、诊断和解释。**Anthropic 将前者定义为预定义代码路径，后者定义为 LLM 动态管理过程与工具使用。[Anthropic：Building effective agents](https://www.anthropic.com/engineering/building-effective-agents)
+
+### 常见面试追问
+
+**🟢 追问 1：Workflow 和 ReAct 到底是不是同一层？**
+
+在粗粒度架构图中都属于 L1，可以并列比较；在运行时实现中通常不是完全同粒度，Workflow 是外层业务编排，ReAct 是某个 Agent 节点内部的动态循环。
+
+**🟡 追问 2：为什么不把整个业务都写成 ReAct？**
+
+因为模型选择具有概率性，调用次数、路径和结果可能变化。退款、发布、审批等步骤需要确定的顺序、权限、幂等、超时、补偿和审计，适合由 Workflow 固定。
+
+**🟡 追问 3：为什么不把排障过程全部写成 Workflow？**
+
+排障路径取决于不断出现的新证据。如果把所有假设和工具组合硬编码成分支，流程会迅速膨胀且难以覆盖未知情况；ReAct 更适合根据 Observation 动态选择调查方向。
+
+**🔴 追问 4：ReAct 执行到一半宕机，怎样恢复？**
+
+不能只保存聊天文本。应持久化 run_id、当前步骤、已调用工具、Observation、Artifact、预算、幂等键和待审批动作；恢复时重新读取外部真实状态，避免把一次有副作用的工具调用重复执行。
+
+### 面试里推荐这样答
+
+> Workflow 和 ReAct 在高层上都属于任务控制方式，所以都可以放在决策与编排层比较：Workflow 是开发者预定义路径，ReAct 是模型根据 Observation 动态决定下一步。但在具体系统实现中，它们通常不是完全同一抽象粒度。Workflow 是外层业务状态机，控制步骤、审批、超时、重试和恢复；ReAct 是某个 Agent 节点内部的 Reason、Action、Observation 循环。企业系统通常用确定性 Workflow 包住 ReAct：让 ReAct 负责调查、搜索和生成候选方案，让 Workflow 负责权限、审批、幂等写入和结果验证。
 
 ---
 
