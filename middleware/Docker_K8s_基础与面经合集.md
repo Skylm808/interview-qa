@@ -243,35 +243,334 @@ Docker 的核心价值是：
 
 ### 4. Docker 是怎么实现隔离的？
 
-这是非常高频的大厂问题。
+这是非常高频的大厂问题。只回答“namespace 做隔离、cgroup 做限流”还不够，最好把 Linux、Docker、容器运行时和 Kubernetes 串成一条链。
 
-#### `namespace`
+#### 4.1 先看全景：它们不是四套互相替代的技术
 
-`namespace` 负责“**看起来隔离**”。
+```text
+┌──────────────────────── Kubernetes ─────────────────────────┐
+│ 声明 Pod、调度 Node、维持副本、发布、自愈、Service、权限等    │
+│ kubelet 根据 PodSpec，通过 CRI 请求节点 runtime 创建 Pod       │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ CRI
+                    containerd / CRI-O
+                             │ OCI runtime spec
+                          runc 等
+                             │ 系统调用 / cgroup filesystem
+                             ▼
+┌──────────────────────── Linux 内核 ─────────────────────────┐
+│ namespace：进程“看见什么”                                  │
+│ cgroup：进程“能用多少、用了多少”                            │
+│ capabilities / seccomp / AppArmor / SELinux：还能做什么       │
+└─────────────────────────────────────────────────────────────┘
 
-常见的 namespace：
+开发机另一条常见路径：
+docker CLI → Docker Engine（dockerd）→ containerd → runc → Linux 内核
+```
 
-- `PID namespace`：进程号隔离
-- `NET namespace`：网络隔离
-- `MNT namespace`：挂载点隔离
-- `IPC namespace`：进程间通信隔离
-- `UTS namespace`：主机名隔离
-- `USER namespace`：用户/权限映射
+四者的关系可以压缩为：
 
-#### `cgroup`
+| 名词 | 所在层 | 核心职责 |
+| --- | --- | --- |
+| Linux namespace | 内核隔离原语 | 给一组进程不同的 PID、网络、挂载点、主机名等视图 |
+| Linux cgroup | 内核资源原语 | 分组统计并控制 CPU、内存、IO、进程数等资源 |
+| Docker | 容器开发与运行产品 | 用镜像、文件系统、namespace、cgroup 和安全策略把应用作为容器运行 |
+| Kubernetes | 集群编排系统 | 声明和调度 Pod，通过节点 runtime 批量管理容器，并把资源要求传到底层 |
 
-`cgroup`（`control groups`）负责“**资源限制**”。
+因此：**namespace 和 cgroup 是 Linux 内核能力；Docker 把这些能力封装成好用的容器产品；Kubernetes 不重新实现容器，而是编排节点上的容器运行时。**Docker 官方也把容器定义为带所需文件的隔离进程，而不是一台迷你虚拟机。[Docker：What is a container?](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/)
 
-比如限制：
+#### 4.2 namespace：隔离的是“视图”，不是资源额度
 
-- CPU
-- 内存
-- 磁盘 IO
-- 进程数
+宿主机最终仍只有一套 Linux 内核。namespace 让同一个内核中的不同进程看到不同的系统资源视图：
 
-所以最常见一句话答法是：
+```text
+宿主机真实进程树：
+PID 1 systemd
+PID 4201 java（容器 A）
+PID 5301 nginx（容器 B）
 
-> **namespace 负责隔离视图，cgroup 负责限制资源。**
+容器 A 的 PID namespace：只看到 java 是 PID 1 及其子进程
+容器 B 的 PID namespace：只看到 nginx 是 PID 1 及其子进程
+```
+
+常见类型：
+
+| Linux namespace | 隔离什么 | 容器中的直观表现 |
+| --- | --- | --- |
+| PID | 进程号和进程树视图 | 容器主进程常看到自己是 PID 1，看不到其他容器进程 |
+| NET | 网卡、IP、路由、端口、网络栈 | 容器有自己的 `eth0`、IP 和端口空间 |
+| MNT | 挂载点和文件系统挂载视图 | 容器看到镜像 rootfs 和挂入的 Volume |
+| IPC | System V IPC、POSIX 消息队列等 | 默认不与其他隔离单元共享 IPC 对象 |
+| UTS | hostname、domain name | 容器或 Pod 可拥有自己的主机名 |
+| USER | UID/GID 与 capability 映射 | 容器内 UID 0 可映射为宿主机非特权 UID |
+| CGROUP | 进程看到的 cgroup 层级 | 隐藏宿主机上不相关的 cgroup 路径 |
+| TIME | 部分系统时钟视图 | 特定场景可使用不同的时间偏移 |
+
+namespace 的关键边界：
+
+- 它解决“看不看得见”，不负责限制最多使用几个 CPU、多少内存；
+- 不同 namespace 里的进程仍共享同一个内核，内核漏洞可能影响隔离边界；
+- `--network=host`、`--pid=host`、特权容器等配置会主动减少隔离；
+- USER namespace 能降低“容器内 root 等于宿主机 root”的风险，但是否启用取决于 Docker/K8s 和节点配置。
+
+#### 4.3 cgroup：组织进程并进行资源统计、分配和限制
+
+`cgroup` 是 control group。Linux 把进程放进一棵层级树，再由 controller 管理资源：
+
+```text
+Node
+├── system.slice/                 系统服务
+└── kubepods.slice/               K8s 工作负载（概念示意）
+    ├── burstable/
+    │   └── pod-abc/
+    │       ├── container-app/
+    │       └── container-sidecar/
+    └── besteffort/
+        └── pod-def/
+```
+
+具体目录名取决于 cgroup v1/v2、`systemd` 或 `cgroupfs` driver 以及 runtime，面试时不应死背路径。cgroup v2 使用统一层级，核心控制文件可以这样理解：
+
+| cgroup v2 文件/控制器 | 作用 | 超限后的典型结果 |
+| --- | --- | --- |
+| `cpu.max` | CPU 带宽上限 | 周期内额度用完后 throttling，进程变慢而不是被杀 |
+| `cpu.weight` | CPU 竞争时的相对权重 | CPU 忙时按权重竞争，不代表预留一颗物理核 |
+| `memory.max` | 内存硬上限 | 回收仍失败时可能在该 cgroup 中触发 OOM Kill |
+| `memory.current` | 当前内存记账 | 用于统计与监控，不是限制本身 |
+| `io.max` / `io.weight` | 块设备 IO 上限/权重 | IO 延迟增加或吞吐被限制 |
+| `pids.max` | 可创建的进程/线程数量 | `fork`/创建线程失败，防止 fork bomb |
+
+Linux 内核文档将 cgroup 定义为：按层级组织进程，并受控地分配系统资源。[Linux Kernel：Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+
+要记住两个反例：
+
+```text
+只有 namespace，没有 cgroup：
+容器看不到别人，但仍可能吃光宿主机 CPU/内存。
+
+只有 cgroup，没有 namespace：
+进程用量受限，但仍可能看到宿主机进程、网络和挂载点。
+```
+
+所以 namespace 和 cgroup 是互补关系，不是谁包含谁。
+
+#### 4.4 Docker 做的不只是调用 namespace 和 cgroup
+
+执行下面的命令：
+
+```bash
+docker run --cpus=1 --memory=512m --pids-limit=200 nginx:1.27
+```
+
+概念上会经历：
+
+```text
+1. Docker 读取镜像配置和只读 layers
+2. 为容器增加可写层，组合出 root filesystem
+3. Docker Engine / containerd 创建容器任务
+4. OCI runtime（常见 runc）创建/加入相应 Linux namespaces
+5. 把容器进程放入 cgroup，设置 CPU、内存、PID 等限制
+6. 应用 capabilities、seccomp、AppArmor/SELinux 等安全策略
+7. 在隔离环境中启动 nginx 主进程
+```
+
+所以更完整的容器抽象是：
+
+```text
+容器
+= 普通 Linux 进程
++ namespace 隔离视图
++ cgroup 资源治理
++ image/rootfs 文件系统
++ capabilities/seccomp/LSM 等权限与系统调用边界
++ runtime 生命周期管理
+```
+
+Docker Engine 启动容器时会创建 namespaces 和 control groups；默认 seccomp 等策略还会进一步收缩系统调用面。[Docker：Engine security](https://docs.docker.com/engine/security/) [Docker：Seccomp profiles](https://docs.docker.com/engine/security/seccomp/)
+
+#### 4.5 Kubernetes 在这条链路中负责什么？
+
+Kubernetes 负责声明、调度和收敛，不亲自在控制面调用 Linux 系统调用创建容器：
+
+```text
+Pod YAML
+  │  replicas、image、resources、securityContext
+  ▼
+API Server → etcd → Controller → Scheduler 选择 Node
+                                      │
+                                      ▼
+                              目标 Node 的 kubelet
+                                      │ CRI
+                                      ▼
+                              containerd / CRI-O
+                                      │
+                   ┌──────────────────┼──────────────────┐
+                   ▼                  ▼                  ▼
+            Pod sandbox/CNI       OCI runtime       CSI/Volume
+            网络 namespace       namespaces/cgroup   挂载到 MNT
+```
+
+各层职责必须讲准：
+
+- Scheduler 根据 `requests`、亲和性、污点等选择 Node，但不创建 namespace/cgroup；
+- kubelet 观察分配给本机的 Pod，通过 CRI 调用 runtime；
+- runtime/OCI runtime 创建 Pod sandbox 和容器，最终使用 Linux namespace、cgroup 等能力；
+- CNI 配置 Pod 网络 namespace、veth、IP 和路由；
+- kubelet 与 runtime 把资源配置落实到 cgroup；
+- Kubernetes Controller 发现 Pod 消失时创建替代 Pod，但不会复活原来的 Linux 进程。
+
+Kubernetes 官方将 Pod 的共享上下文描述为一组 Linux namespaces、cgroups 和其他隔离机制；节点必须安装容器运行时才能真正运行 Pod。[Kubernetes：Pods](https://kubernetes.io/docs/concepts/workloads/pods/)
+
+#### 4.6 Pod 里多个容器，到底共享哪些 namespace 和 cgroup？
+
+“同一 Pod 的容器共享所有 namespace”是错误说法。
+
+```text
+Pod sandbox（常由 pause/infra container 持有 Pod 级上下文）
+├── 共享 NET namespace：一个 Pod IP、同一端口空间、localhost 通信
+├── Pod 级资源边界：Pod/容器 cgroup 形成层级
+├── Container A：自己的 rootfs / MNT namespace，默认有自己的 PID 视图
+└── Container B：自己的 rootfs / MNT namespace，默认有自己的 PID 视图
+```
+
+关键点：
+
+- **网络一定按 Pod 共享。**同一 Pod 的容器共用 Pod IP 和端口空间，可以用 `localhost` 通信；
+- **文件系统根视图不直接共享。**每个容器有自己的镜像 rootfs 和 mount namespace，需要通过同一个 Volume 共享目录；
+- **PID 默认不必共享。**设置 `shareProcessNamespace: true` 后，同一 Pod 的容器才可直接看到彼此进程；
+- **cgroup 通常是层级关系。**Pod 有整体边界，各容器还可有自己的资源配置，具体层级由 kubelet、QoS 和 runtime 实现；
+- `hostNetwork`、`hostPID`、`hostIPC` 会让 Pod 加入宿主机对应 namespace，应谨慎使用。
+
+Kubernetes 网络模型明确规定，一个 Pod 有独立且由其中所有容器共享的 network namespace。[Kubernetes：Services, Load Balancing, and Networking](https://kubernetes.io/docs/concepts/services-networking/)
+
+#### 4.7 requests / limits 最终怎样落到 cgroup？
+
+示例：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: order-api
+spec:
+  containers:
+    - name: app
+      image: example.com/order-api:v1
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
+```
+
+不要把 request 和 limit 都说成“cgroup 硬限制”：
+
+| 配置 | 调度阶段 | 运行阶段 |
+| --- | --- | --- |
+| CPU request | Scheduler 用它核算 Node 是否放得下 | 通常影响 CPU 竞争权重，不是独占 0.5 个物理核 |
+| CPU limit | 不代表调度预留 | runtime 配置 cgroup CPU 带宽；超过后 throttling |
+| Memory request | Scheduler 用它核算容量，也影响 Pod QoS | 不是提前锁住一块不可被别人使用的内存 |
+| Memory limit | 不代表节点一定有等量空闲内存 | runtime 配置内存上限；内存压力/超限时可能 OOM Kill |
+
+完整链路是：
+
+```text
+resources.requests
+   └──► Scheduler：决定“放到哪个 Node”
+
+resources.requests / limits
+   └──► kubelet + runtime：计算 Pod/容器资源配置
+           └──► Linux cgroup：统计、权重、限速、OOM 等真正执行
+```
+
+cgroup 不是调度器：它只能管理已经在这台机器上运行的进程；Scheduler 才负责事前选择 Node。Kubernetes 官方也要求 kubelet 与 runtime 使用一致的 cgroup driver；在使用 systemd 的系统上，通常应配合 `systemd` driver，避免两个管理者看到不一致的资源层级。[Kubernetes：Container runtimes and cgroup drivers](https://kubernetes.io/docs/setup/production-environment/container-runtimes/) [Kubernetes：cgroup v2](https://kubernetes.io/docs/concepts/architecture/cgroups/)
+
+#### 4.8 Docker 和 Kubernetes 是什么关系？K8s 是否必须安装 Docker？
+
+不必须。要把“Docker 镜像”和“Docker Engine”分开：
+
+```text
+开发 / CI：Dockerfile → Docker/BuildKit 构建 OCI image → Registry
+生产 K8s：Registry → containerd/CRI-O 拉 OCI image → runc → Linux 进程
+```
+
+- Docker 常用于开发、构建和本地运行容器；
+- OCI 标准让镜像可以被不同运行时识别；
+- kubelet 通过 CRI 连接 containerd、CRI-O 等 runtime；
+- Kubernetes v1.24 已移除内置 `dockershim`，但这不影响用 Docker/BuildKit 构建镜像；
+- 如确需 Docker Engine，可通过外部 `cri-dockerd` 适配，但它不是 K8s 的必需组件。
+
+因此“Docker 是 K8s 的底层”只在非常宽泛的历史语境下勉强成立。更准确的表达是：
+
+> **Docker 和 Kubernetes 都使用容器标准及 Linux 内核能力；Docker 偏构建与单机容器体验，Kubernetes 通过 CRI 编排集群节点上的 runtime。**
+
+Kubernetes 官方容器运行时文档明确说明 dockershim 自 v1.24 起移除，并列出 containerd、CRI-O 等 CRI runtime。[Kubernetes：Container runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+
+#### 4.9 namespace + cgroup 是否等于安全容器？
+
+不等于。容器共享宿主机内核，namespace/cgroup 主要解决视图和资源边界，完整安全还需要：
+
+- 非 root 用户、USER namespace 或 rootless 模式；
+- 删除不必要的 Linux capabilities，禁止 `privileged`；
+- seccomp 限制系统调用；
+- AppArmor/SELinux 限制文件和进程访问；
+- 只读 root filesystem，谨慎使用 `hostPath`；
+- Kubernetes Pod Security、RBAC、NetworkPolicy 和最小权限 ServiceAccount；
+- 不可信多租户场景按风险使用 gVisor、Kata Containers/microVM 或独立节点。
+
+虚拟机通常有独立 Guest Kernel，安全边界更厚但启动和资源成本更高；普通容器共享 Host Kernel，密度更高但更依赖内核与配置安全。
+
+#### 4.10 一道完整例子：一个 Pod 最终怎样成为受限进程？
+
+```text
+1. 用户提交 Deployment：3 个副本，每个 500m/512Mi，limit 1C/1Gi
+2. Controller 创建 Pod 对象；Scheduler 按 request 为每个 Pod 选 Node
+3. Node 上 kubelet 经 CRI 请求 containerd 创建 Pod sandbox
+4. runtime 创建 Pod 网络 namespace；CNI 接入 veth、分配 Pod IP
+5. runtime 准备镜像 rootfs 和各容器的 mount/PID 等 namespace
+6. kubelet/runtime 创建 Pod 与 container cgroup，写入 CPU/内存参数
+7. OCI runtime 启动应用进程；它仍能在宿主机进程表中找到
+8. CPU 超 limit 时内核 throttling；内存超限且回收失败时可能 OOM Kill
+9. kubelet 观察退出并上报；restartPolicy/Controller 决定重启或补新 Pod
+```
+
+这一串分别体现：
+
+```text
+K8s：我要几个、放哪里、挂了怎样收敛
+Runtime：怎样把 PodSpec 变成节点上的容器
+namespace：这些进程看到什么
+cgroup：这些进程最多能用多少、当前用了多少
+Docker/OCI image：启动所需文件和配置从哪里来
+```
+
+#### 4.11 常见面试追问
+
+**🟢 追问 1：namespace 和 cgroup 有什么区别？**
+
+namespace 隔离系统资源视图，例如 PID、网络和挂载点；cgroup 按进程组统计、分配和限制 CPU、内存、IO、PID 数。前者管“看见什么”，后者管“能用多少”，二者互补。
+
+**🟢 追问 2：容器是不是一台轻量虚拟机？**
+
+不是。容器本质是宿主机上的受限进程，共享 Host Kernel；虚拟机虚拟硬件并运行独立 Guest OS/Kernel。容器轻量，虚拟机通常隔离更强。
+
+**🟡 追问 3：Kubernetes Namespace 和 Linux namespace 是一回事吗？**
+
+不是。Linux namespace 是内核进程隔离机制；Kubernetes Namespace 是 API 对象的逻辑分组，用于名称范围、RBAC、ResourceQuota 等管理。后者本身不会创建一套新的 Linux 网络/PID namespace，也不是强多租户边界。
+
+**🟡 追问 4：K8s 的 CPU limit 和 memory limit 超过后表现一样吗？**
+
+不一样。CPU 是可压缩资源，超出带宽额度通常被 throttling，表现为延迟升高；内存不可压缩，超过上限且回收失败时可能触发 cgroup OOM，进程被杀，K8s 再依据策略重启或补实例。
+
+**🔴 追问 5：为什么 K8s 移除 Docker，Docker 构建的镜像还能运行？**
+
+移除的是 kubelet 内置的 dockershim，不是 OCI 镜像标准。Docker/BuildKit 构建并推送的 OCI 兼容镜像仍能由 containerd、CRI-O 拉取，再交给 runc 等 OCI runtime 运行。
+
+#### 面试里推荐这样答
+
+> 容器本质是宿主机上的一组进程。Linux namespace 隔离 PID、网络、挂载点等视图，cgroup 对进程组统计并限制 CPU、内存、IO 和进程数；镜像 rootfs、capabilities、seccomp 和 LSM 再补齐文件系统与安全边界。Docker 把这些内核能力、OCI runtime、镜像和生命周期封装成开发与单机运行体验。Kubernetes 位于更上层：Controller 维持期望状态，Scheduler 根据 request 选择 Node，目标 Node 的 kubelet 通过 CRI 调 containerd 或 CRI-O，最终由 runtime 创建 Pod/容器 namespace 和 cgroup。Pod 内容器共享 network namespace，但不代表共享所有 namespace；CPU limit 超出通常 throttling，内存超限可能 OOM Kill。K8s 从 v1.24 移除的是 dockershim，不是 Docker 镜像，生产节点并不必须安装 Docker Engine。
 
 ---
 
@@ -1563,6 +1862,13 @@ containers:
    https://kubernetes.io/docs/tasks/run-application/update-deployment-rolling/
 20. Kubernetes Disruptions（PDB、优雅终止与滚动更新边界）  
    https://kubernetes.io/docs/concepts/workloads/pods/disruptions/
+21. [Docker：What is a container?](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/)
+22. [Docker Engine Security（namespace、cgroup、seccomp 等边界）](https://docs.docker.com/engine/security/)
+23. [Linux Kernel：Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+24. [Kubernetes Pods（Pod 共享上下文与网络 namespace）](https://kubernetes.io/docs/concepts/workloads/pods/)
+25. [Kubernetes cgroup v2](https://kubernetes.io/docs/concepts/architecture/cgroups/)
+26. [Kubernetes Container Runtimes（CRI、cgroup driver、dockershim）](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+27. [Kubernetes：Share Process Namespace between Containers in a Pod](https://kubernetes.io/docs/tasks/configure-pod-container/share-process-namespace/)
 
 ### 公开面经 / 公开讨论（牛客为主）
 
