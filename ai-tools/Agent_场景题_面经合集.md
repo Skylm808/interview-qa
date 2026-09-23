@@ -2706,7 +2706,7 @@ Subagent 返回的也不应只是自然语言“完成了”，而应包含：
 
 ### 一、总体抽象：不要把一次 CR 设计成一次不可恢复的大模型请求
 
-> 我会把 PR 按文件、函数和语义完整的 diff chunk 拆成可持久化任务，为整个 Review 设置 Token/金额/时间预算。每个 chunk 独立执行，完成后立即保存 checkpoint、finding、token usage 和模型版本。主模型限流、超时或预算不足时，由 Model Router 对剩余 chunk 降级或切换模型；Worker 重启后只恢复未完成部分，最后统一合并、去重和验证 Findings。
+> 我会把 PR 按文件、函数和语义完整的 diff chunk 拆成可持久化任务，为整个 Review 设置 Token/金额/时间预算。Checkpoint 不是模型记忆，而是任务在安全恢复点的持久化状态：结构化进度存在 SQLite 或生产关系型数据库，大型输入输出存在 Artifact/对象存储并由数据库保存 URI 和校验值。每个 chunk 独立执行，完成后把 checkpoint、finding、token usage 和模型版本放在同一事务中提交。主模型限流、超时或预算不足时，由 Model Router 对剩余 chunk 降级或切换模型；Worker 重启后只恢复未完成部分，最后统一合并、去重和验证 Findings。
 
 记忆主线：
 
@@ -2765,7 +2765,90 @@ used + estimated_next > total_budget ?
 
 安全、权限、并发、事务和数据迁移等高风险代码优先使用强模型；文档、格式和简单样板可用小模型。降级必须在报告中保留 `model/reason/coverage`，不能假装所有文件都经过同等强度审查。
 
-### 四、Checkpoint 存什么？怎样恢复？
+### 四、Checkpoint 是什么、存在哪里、怎样恢复？
+
+#### 1. Checkpoint 到底是什么？
+
+Checkpoint 是 Agent Run 执行到一个**可安全恢复边界**时，保存的一组持久化状态。它回答：
+
+```text
+这个任务是谁？基于哪个代码版本？
+已经完成哪些 chunk？哪些还没完成？
+每个 chunk 用了什么模型和多少 Token？
+已产生哪些 Finding / Artifact？
+失败在哪里、能否重试、下次从哪里开始？
+```
+
+它不是：
+
+- 进程内存或某个 Go struct 的临时副本；
+- LLM 的隐藏推理过程；
+- 完整对话原文的无差别备份；
+- 一条“已经执行到第 3 步”的孤立数字；
+- MQ 中尚未消费的一条消息。
+
+更准确的抽象是：
+
+```text
+Checkpoint
+= Task 状态
++ Chunk 状态
++ 输入版本/Hash
++ 已验证输出和 Artifact 引用
++ Budget / Attempt / Error
++ Lease / Version 等并发控制信息
+```
+
+保存粒度通常选 **chunk 级**：太粗会在失败后重复消耗大量 Token；细到每一个模型 token 又没有必要，还会产生很高的写放大。
+
+#### 2. Checkpoint 具体存在哪里？
+
+不同数据放在适合它的事实源中：
+
+```text
+┌────────────────────────────────────────────────────┐
+│ SQLite / MySQL / PostgreSQL                        │
+│ task、chunk、status、attempt、token、lease、finding │
+│ artifact_uri、checksum、版本号                     │
+└───────────────────────┬────────────────────────────┘
+                        │ 引用
+                        ▼
+┌────────────────────────────────────────────────────┐
+│ Artifact / 对象存储                                 │
+│ 大 diff、完整模型响应、测试日志、报告、trace bundle  │
+└────────────────────────────────────────────────────┘
+
+Git：保存真正的源码和 base/head commit
+MQ：只负责通知“某个 chunk 可以执行”，不是状态事实源
+Redis：可做短期 lease/cache/并发控制，不应单独保存最终 Checkpoint
+```
+
+| 数据 | 推荐存储 | 原因 |
+| --- | --- | --- |
+| Task/Chunk 状态、次数、预算、租约 | SQLite 或 MySQL/PostgreSQL | 需要事务、唯一约束、条件更新和恢复查询 |
+| Finding 结构化字段 | 关系型数据库 | 需要去重、筛选、聚合和生成报告 |
+| 大 Diff、原始模型输出、测试日志 | 对象存储/Artifact Store | 体积大，DB 只保存 URI、hash、大小和保留期 |
+| 代码版本 | Git commit SHA | Git 才是代码事实源，恢复时可重建相同工作区 |
+| 待执行通知 | MQ | 解耦调度和 Worker，可重复投递但不作为唯一状态 |
+
+单机 CLI 可以直接保存到项目数据目录里的 SQLite 文件，例如：
+
+```text
+~/.cr-agent/state.db          # Task/Chunk/Finding/Artifact 元数据
+~/.cr-agent/artifacts/<task>/ # 本地 Artifact；也可换成对象存储
+```
+
+生产多副本部署则通常是：
+
+```text
+Worker Pods → MySQL/PostgreSQL（共享 Checkpoint 事实源）
+            → S3/OSS/COS（大型 Artifact）
+            → MQ（任务通知和重投）
+```
+
+路径只是示例，关键不是目录名称，而是 Checkpoint 必须位于 **Worker 重启后仍存在、其他 Worker 也能读取**的持久化存储中；只放本机内存或容器临时目录无法实现真正断点续跑。
+
+#### 3. Checkpoint 表里存什么？
 
 ```text
 review_task
@@ -2780,6 +2863,16 @@ finding
 task_id | chunk_id | rule_id | file | line | evidence_hash | severity
 ```
 
+可以再增加 Artifact 元数据：
+
+```text
+review_artifact
+artifact_id | task_id | chunk_id | type | uri
+checksum | size | created_at | expires_at
+```
+
+数据库只保存可查询元数据和指针。恢复时下载 Artifact 后必须校验 checksum，防止拿到不完整或属于旧代码版本的结果。
+
 状态机：
 
 ```text
@@ -2788,6 +2881,39 @@ PENDING → RUNNING → SUCCESS
               ├──► FAILED
               └──► CANCELLED
 ```
+
+#### 4. 什么时候写 Checkpoint？
+
+至少在这些状态变化后持久化：
+
+1. 创建 Task 并确定 `base_commit/head_commit`；
+2. Chunk 切分完成并保存 `content_hash`；
+3. Worker 原子抢占 Chunk，写入 `RUNNING + lease + attempt`；
+4. 模型响应经过 Schema/证据校验，Finding 和 token usage 已准备提交；
+5. Chunk 进入 `SUCCESS/RETRY_WAIT/FAILED/CANCELLED`；
+6. Findings 完成合并，最终 Report Artifact 生成。
+
+关键成功路径应放进一个数据库事务：
+
+```text
+BEGIN
+  INSERT findings ... ON CONFLICT/UNIQUE 去重
+  INSERT artifact metadata(uri, checksum, ...)
+  UPDATE review_chunk
+     SET status='SUCCESS', token_used=?, version=version+1
+   WHERE task_id=? AND chunk_id=? AND version=?
+  UPDATE review_task SET completed_chunks=completed_chunks+1, ...
+COMMIT
+ACK MQ message
+```
+
+- **提交前崩溃：**事务回滚，消息重投后重新执行；
+- **提交后、ACK 前崩溃：**消息会重复投递，但 Worker 读取到 `SUCCESS + 相同 content_hash` 后直接跳过；
+- **先 ACK 再提交：**进程在两者之间崩溃会丢任务，因此不能这样排序。
+
+如果 Artifact 必须先上传对象存储，可以先上传带唯一 task/chunk 前缀的临时对象，再在 DB 事务中登记最终 URI；未被 DB 引用的孤儿对象由后台任务按 TTL 清理。数据库与对象存储无法靠一个普通本地事务强行原子提交，需要幂等命名、状态机和清理补偿。
+
+#### 5. Worker 怎样从 Checkpoint 恢复？
 
 恢复流程：
 
@@ -2804,6 +2930,18 @@ PENDING / 可重试 FAILED：继续执行
 ```
 
 `task_id + chunk_id + content_hash` 可作为幂等依据；状态更新用版本号/CAS，Worker 使用 lease 和 fencing token，避免旧 Worker 超时后回来覆盖新结果。Finding 也应有稳定指纹，防止重复执行生成两条相同评论。
+
+恢复时还要重新校验 `base/head commit`。如果 PR 已更新，不能直接把旧 Checkpoint 当成当前结论：未变化且依赖未受影响的 chunk 可以复用，变化的 chunk 必须失效并重跑。
+
+#### 6. Checkpoint 的安全和生命周期
+
+Code Review Artifact 可能包含私有源码、Prompt、模型响应和测试日志，因此需要：
+
+- 按仓库/租户做 ACL，Worker 使用短期凭证；
+- 数据库和对象存储加密，日志隐藏 Secret 和个人数据；
+- Artifact 设置 TTL，最终报告与审计记录按合规周期保留；
+- 删除任务时同时清理 DB 元数据和对象存储内容；
+- Trace 中优先保存 hash、大小和 URI，不默认复制完整源码。
 
 ### 五、模型切换为什么不能“续上上一个模型的脑内状态”？
 
@@ -2823,9 +2961,9 @@ PENDING / 可重试 FAILED：继续执行
 - 质量是否通过同一套 Code Review Eval；
 - 当前 chunk 是否已经产生结果未知的副作用。
 
-### 六、Checkpoint 存 SQLite 还是 MySQL/PostgreSQL？
+### 六、不同部署形态怎样选择 Checkpoint Store？
 
-技术选型取决于部署形态：
+第四节中的结构化 Checkpoint 需要一个可持久化、支持事务的 Store，具体选型取决于部署形态：
 
 | 场景 | 选择 | 原因 |
 | --- | --- | --- |
@@ -2857,9 +2995,13 @@ SQLite 不是“性能一定更好”，而是单机阶段复杂度最低。Stor
 
 把一次 attempt 记录为结果未知，先查询供应商/任务状态；无法确认时可用同一 attempt/key 重试，并依靠 chunk 和 Finding 指纹去重。若工具产生外部副作用，还必须由工具端保证幂等，不能只靠 Agent 状态。
 
+**🟡 追问 4：Checkpoint 能不能只存在 MQ 或 Redis？**
+
+不建议。MQ 负责通知和重投，不适合查询一条 Run 的完整恢复状态；Redis 可保存短期 lease、缓存和并发计数，但单独作为最终事实源会让持久化、事务和审计边界变弱。结构化 Checkpoint 应落 SQLite/MySQL/PostgreSQL，大型结果放 Artifact/对象存储，MQ 和 Redis 只承担辅助职责。
+
 ### 面试里推荐这样答
 
-> 生产级 Code Review Agent 应是有状态的分片任务系统，而不是一次大模型请求。我会按文件、函数和语义完整性切 chunk，以 task/chunk/content hash 保证幂等；Controller 为 PR 维护 token、金额、时长预算，高风险代码使用强模型，低风险代码可降级。每个 chunk 完成就持久化 checkpoint、finding、模型和 token usage，故障后跳过未变化的 SUCCESS chunk，只恢复 PENDING、失败或租约过期任务。模型切换依赖显式 Task State 和 Artifact，不依赖隐藏上下文。单机阶段可用 SQLite 降低部署复杂度，多 Worker 生产环境迁移到 MySQL/PostgreSQL，并用 MQ 分发、DB 保存事实状态，最后对 Findings 去重验证并明确报告覆盖范围。
+> 生产级 Code Review Agent 应是有状态的分片任务系统，而不是一次大模型请求。我会按文件、函数和语义完整性切 chunk，以 task/chunk/content hash 保证幂等；Controller 为 PR 维护 token、金额、时长预算，高风险代码使用强模型，低风险代码可降级。Checkpoint 是任务在安全恢复点的持久化状态，不是模型记忆：单机把 task、chunk、finding、token 和 lease 存 SQLite，多 Worker 生产环境存 MySQL/PostgreSQL；大 diff、模型原始输出和测试日志放对象存储，DB 保存 URI 与 checksum，Git 保存代码版本，MQ 只负责唤醒。每个 chunk 成功后把状态和 Finding 在事务中提交再 ACK 消息；故障后跳过未变化的 SUCCESS chunk，只恢复 PENDING、失败或租约过期任务。模型切换依赖这些显式 Task State 和 Artifact，不依赖隐藏上下文。
 
 ## 参考资料
 
