@@ -4,6 +4,158 @@
 
 ---
 
+## Kafka 可靠性专题
+
+### Kafka 的生产者可靠性和消费者可靠性分别怎么保证？二者有什么关系？
+
+**先说结论：**
+
+生产者可靠性解决的是：**业务产生的事件，能不能可靠、尽量只写一次地进入 Kafka 日志**；消费者可靠性解决的是：**Kafka 中已有的事件，能不能可靠地转化为业务结果，并正确推进消费进度**。
+
+它们通过“Kafka 日志中的消息”连接，但属于两个独立的故障边界，谁也不能替代谁。完整链路可以抽象成：
+
+```text
+业务事务             生产者                  Broker                 消费者
+┌──────────┐    ┌──────────────┐    ┌────────────────┐    ┌────────────────────┐
+│订单落库   │ -> │重试 + 幂等发送 │ -> │副本 + ISR      │ -> │业务成功 + 幂等处理   │
+│Outbox事件 │    │acks=all      │    │持久化 Kafka 日志│    │再提交 offset       │
+└──────────┘    └──────────────┘    └────────────────┘    └────────────────────┘
+      │                                                        │
+      └─ 防止“业务成功但没发消息”             防止重复副作用、错误推进进度 ─┘
+```
+
+#### 一、生产者可靠性：保证消息可靠进入 Kafka
+
+不能只背一个 `acks=all`，应该从“业务事件有没有产生”一直看到“Broker 有没有持久化”：
+
+| 层次 | 可能的问题 | 主要手段 |
+| --- | --- | --- |
+| 业务系统到 Producer | 订单已提交，服务却在发送 Kafka 前宕机 | 关键事件使用 **Transactional Outbox / 本地消息表 + CDC 或补偿任务** |
+| Producer 发送 | 网络抖动、Leader 切换导致发送失败或响应丢失 | `retries`、合理的 `delivery.timeout.ms`、检查异步发送回调或 Future |
+| Producer 重试 | Broker 已写入但 ACK 丢了，重试产生重复消息 | `enable.idempotence=true`；同时保留业务 `event_id` |
+| Broker 持久化 | Leader 刚写入就宕机，副本尚未同步 | `acks=all`、足够的副本数、合理的 `min.insync.replicas` |
+| 顺序性 | 失败重试后，同一业务的消息发生乱序 | 相同业务 Key 落到同一 Partition；开启幂等，并控制并发飞行请求 |
+
+一组常见的生产者配置思路是：
+
+```properties
+acks=all
+enable.idempotence=true
+retries=适当的大值
+delivery.timeout.ms=按业务可接受时延设置
+```
+
+Topic 侧还需要配合副本，例如 `replication.factor=3`，并设置 `min.insync.replicas=2`。生产者使用 `acks=all` 时，当前 ISR 中的全部副本都要确认；如果 ISR 数量已经少于 2，Broker 会拒绝写入。也就是说，系统宁可让本次发送失败，也不在可同步副本不足时冒险写入。
+
+这里有三个边界要说清楚：
+
+1. **必须检查发送结果。** Kafka Producer 通常异步发送；如果调用 `send()` 后不等待结果，也不处理回调异常，配置再可靠，应用也可能不知道消息最终失败。
+2. **Producer 幂等只解决发送重试导致的重复写入。** 应用重启后重新构造并发送同一个业务事件，不应只依赖 Producer 幂等，仍要携带全局唯一的 `event_id`。
+3. **`acks=all` 不解决数据库与 Kafka 的双写。** 订单事务提交后、调用 Kafka 前宕机，Kafka 根本收不到消息；高可靠场景要在同一个数据库事务里写订单和 Outbox，再由 CDC 或后台任务投递。
+
+根据 Kafka 官方配置说明，幂等生产要求 `acks=all`、允许重试，并将 `max.in.flight.requests.per.connection` 控制在不超过 5；这些条件冲突时，幂等可能无法启用。可参考 [Kafka Producer 配置](https://kafka.apache.org/41/configuration/producer-configs/)。
+
+#### 二、消费者可靠性：保证消息可靠转化为业务结果
+
+消费者最关键的不是“能否 poll 到消息”，而是处理结果与 offset 的提交顺序：
+
+```text
+错误顺序：poll -> 提交 offset -> 写数据库
+                         └─ 此处宕机：Kafka 认为已经消费，业务结果却没有，造成丢处理
+
+推荐顺序：poll -> 本地事务：业务写入 + event_id 去重记录 -> 提交事务 -> 提交 offset
+                                                           └─ 此处宕机：会重放，但幂等后只生效一次
+```
+
+具体需要做好以下几件事：
+
+1. **关闭自动提交，业务成功后再提交 offset。** 常见做法是 `enable.auto.commit=false`，只有业务事务提交成功后，才手动提交相应 Partition 的 offset。Kafka 提交的 offset 表示“下一条要读取的位置”。
+2. **消费者必须有业务幂等。** 在同一个本地事务中写业务表和消费记录表，并给 `(consumer_group, event_id)` 建唯一约束；消息重放时发现已处理，就不再重复扣款、加积分或扣库存。
+3. **失败时不能悄悄推进 offset。** 临时故障应有限重试并退避；无法处理的毒消息可进入重试 Topic 或 DLQ，同时告警和保留人工补偿入口，避免永久阻塞一个 Partition。
+4. **正确处理 Rebalance 和并行消费。** 单条处理时间不要超过 `max.poll.interval.ms`；发生分区撤销时停止接新任务，完成或安全中止在途任务，再提交已经连续处理完成的 offset。一个 Partition 内并发处理时，不能因为 offset 12 先完成，就跳过仍在处理的 offset 11。
+5. **事务消息只读已提交数据。** 上游使用 Kafka Transaction 时，下游可配置 `isolation.level=read_committed`，避免读到后来被回滚的事务消息。
+
+消费者的核心伪代码如下：
+
+```text
+for record in poll():
+    begin database transaction
+        insert consumed_event(group, record.event_id)  // 唯一键去重
+        update business_state(...)                     // 真正业务操作
+    commit database transaction
+
+    commit Kafka offset                                // 业务成功后再提交
+```
+
+如果数据库事务成功、offset 提交前宕机，消息会再次投递，这就是 **at-least-once**。重放不可怕，真正危险的是业务没有幂等，导致同一订单被重复扣款。Kafka 官方设计文档也明确区分了“发布消息的持久性”和“消费处理保证”，可参考 [Kafka Design：Delivery Semantics](https://kafka.apache.org/41/design/design/#messagesemantics)。
+
+#### 三、生产者与消费者有什么关系？
+
+二者共同组成端到端可靠性，但保护的是不同阶段：
+
+```text
+事件 E 可靠进入 Kafka                 E 只产生一次业务效果 F(E)
+┌──────────────────┐                  ┌──────────────────────┐
+│ Producer 可靠性   │ -- offset=N --> │ Consumer 可靠性       │
+└──────────────────┘                  └──────────────────────┘
+```
+
+| 故障窗口 | 只靠哪一端也不够 | 正确处理 |
+| --- | --- | --- |
+| 订单已写库，事件还没发出就宕机 | 消费者再可靠也读不到消息 | Outbox / CDC / 补偿 |
+| Broker 已写入，Producer 没收到 ACK | 消费者幂等不能阻止 Kafka 日志出现重复记录 | Producer 重试 + Producer 幂等 |
+| 消费者写库成功，提交 offset 前宕机 | Producer 幂等不能阻止消息被重新消费 | 业务 `event_id` 去重 + 成功后提交 offset |
+| 消费者先提交 offset，业务处理前宕机 | Producer 可靠也无法补回被跳过的业务处理 | 禁止提前提交 offset |
+
+所以，**生产者幂等和消费者幂等不是一回事**：
+
+- Producer 幂等是 Kafka 协议层能力，主要防止一次发送过程因重试而在日志中重复追加。
+- Consumer 幂等是业务层能力，防止消息重投、Rebalance 或进程宕机后重复执行外部副作用。
+
+实际系统常常两个都要开，并给消息设计稳定的 `event_id`，让生产、消费、追踪和对账使用同一个业务身份。
+
+#### 四、能否做到端到端 Exactly Once？
+
+需要先说明“恰好一次”的范围：
+
+- **Kafka -> 计算 -> Kafka：** 可以使用 Kafka Transaction，把“写入下游 Topic”和“提交上游 offset”放在同一个事务中；下游使用 `read_committed`，可实现 Kafka 范围内的 Exactly Once。
+- **Kafka -> MySQL / 支付 / 短信：** Kafka 事务不能自动覆盖外部系统。工程上通常采用 `at-least-once + 业务幂等 + Outbox + 对账补偿`，保证最终只产生一次有效业务结果。
+
+因此线上常见的可靠性组合是：
+
+```text
+生产端：Outbox + event_id + acks=all + retries + Producer 幂等
+Broker：多副本 + min.insync.replicas + ISR/副本异常监控
+消费端：手动提交 offset + 本地事务 + event_id 唯一约束 + 重试/DLQ
+全链路：Lag、最老消息年龄、发送失败率、重试率、DLQ 和对账监控
+```
+
+#### 五、订单积分例子
+
+假设订单服务产生 `OrderPaid(event_id=E1001, order_id=1001)`，积分服务消费后加 100 积分：
+
+1. 订单服务在一个数据库事务内更新订单为已支付，并插入 Outbox 事件 `E1001`。
+2. 投递任务把 `E1001` 发送到 Kafka，等待 `acks=all`；超时可重试，Producer 幂等避免发送重试造成重复追加。
+3. 积分服务消费消息，在同一数据库事务内插入消费记录 `E1001` 并增加积分；消费记录有唯一索引。
+4. 本地事务成功后提交 offset。即使此时宕机并重放 `E1001`，唯一索引也会识别出“已经加过积分”。
+5. Outbox 长时间未投递、Kafka 消费 Lag 异常或消息进入 DLQ 时触发告警，并通过订单与积分流水对账补偿。
+
+这样各层允许“重试和重放”，但最终业务效果只生效一次，比假设网络永不超时更可靠。
+
+#### 常见追问
+
+1. **基础：为什么不能开启自动提交 offset？** 说明自动提交与业务成功没有天然原子关系，以及提前提交造成的丢处理窗口。
+2. **进阶：`acks=all` 是否代表绝对不丢？** 说明副本、ISR、磁盘故障和数据库-Kafka 双写边界。
+3. **进阶：Producer 幂等开启后，消费者还需要幂等吗？** 需要；两者防护的重复来源和作用范围不同。
+4. **高级：并发处理一个 Partition 时如何安全提交 offset？** 只能提交已经连续完成的最大位置，可维护完成区间/水位线，不能跨过尚未完成的消息。
+5. **高级：Kafka 事务为何不能保证 MySQL 恰好一次？** 因为 MySQL 不在 Kafka 事务协调器的原子提交范围内，需要外部系统配合。
+
+**面试里推荐这样答：**
+
+> 生产者可靠性保证消息可靠进入 Kafka，主要靠 Outbox 兜住业务双写，再用 `acks=all`、重试、Producer 幂等以及 Broker 多副本保证发送和存储；消费者可靠性保证消息可靠变成业务结果，主要靠业务成功后手动提交 offset、本地事务和 `event_id` 唯一约束实现幂等，并配合有限重试、DLQ 和 Rebalance 处理。两者通过 Kafka 日志衔接但不能互相替代：生产端可靠而消费者提前提交会丢业务处理，消费端可靠而生产端没写入则根本无消息。Kafka 到 Kafka 可用事务实现限定范围的 Exactly Once；涉及数据库或外部接口时，通常采用 at-least-once 加业务幂等、Outbox 和对账补偿。
+
+---
+
 ## Kafka
 
 ### 1. Kafka 的核心架构是什么？Topic、Partition、Broker 分别是什么？
